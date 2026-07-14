@@ -198,7 +198,9 @@ function doPost(e) {
 
 function handleCommand_(text) {
   const parts = text.split(/\s+/);
-  const cmd = parts[0].toLowerCase();
+  // Telegram ajoute parfois "@nomdubot" à la commande (ex: "/aide@mon_bot")
+  // quand elle est tapée depuis la liste de suggestions — on l'ignore.
+  const cmd = parts[0].toLowerCase().split("@")[0];
   const arg = parts.slice(1).join(" ").trim();
   const state = getState_();
 
