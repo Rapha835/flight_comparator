@@ -83,6 +83,60 @@ C'est la cause n°1 de « commandes qui ne marchent pas » : un webhook qui poin
 - **Pas d'interlining virtuel.** Contrairement à Kiwi/FlightList, ce système ne combine pas des billets aller-simple de compagnies sans accord entre elles.
 - **Le module cabines premium est un scraping non officiel** de Google Flights (reverse engineering du format de requête interne). Il peut cesser de fonctionner sans préavis si Google modifie sa page — c'est pour ça qu'il est isolé et n'affecte jamais le suivi principal.
 
+## FAQ / Dépannage
+
+### Le bot ne répond à aucune commande (même `/aide`)
+
+C'est presque toujours l'un de ces trois cas, à vérifier dans l'ordre :
+
+1. **Le webhook n'est pas enregistré.** Ouvre dans ton navigateur :
+   `https://api.telegram.org/bot<TON_TOKEN>/getWebhookInfo`
+   - Si `"url":""` → le webhook n'existe pas : remplis `WEB_APP_URL` avec l'URL `/exec` de ton déploiement, puis exécute `registerWebhook()` (le journal doit afficher `"ok":true`).
+   - Si l'URL affichée ne correspond pas à celle visible dans **Déployer → Gérer les déploiements** → même remède.
+   - Regarde aussi `last_error_message` : il te dit pourquoi Telegram n'arrive pas à joindre ton script.
+2. **Le déploiement n'est pas public.** Dans « Gérer les déploiements », « Qui a accès » doit être **Tout le monde** (le script vérifie ton `chat_id` à chaque message, personne d'autre ne peut le piloter).
+3. **Mauvais `chat_id`.** Le script ignore *silencieusement* tout message venant d'un autre chat. Vérifie ton id via `https://api.telegram.org/bot<TON_TOKEN>/getUpdates` après avoir envoyé un message au bot (supprime d'abord le webhook si besoin : `.../deleteWebhook`, puis ré-exécute `registerWebhook()` à la fin).
+
+**Comment savoir si Telegram atteint ton script :** panneau **Exécutions** (⏱) dans l'éditeur Apps Script. Envoie `/aide` : si aucune ligne `doPost` n'apparaît, le problème est côté webhook/déploiement (cas 1 ou 2) ; si `doPost` apparaît mais que le bot ne répond pas, c'est le `chat_id` (cas 3).
+
+### Le bot répond, mais avec l'ancien comportement (ou une ancienne version dans `/aide`)
+
+Le déploiement Web App **fige le code au moment du déploiement**. Sauvegarder le fichier ne suffit pas : **Déployer → Gérer les déploiements → ✏️ → Version : « Nouvelle version » → Déployer**. Ne crée PAS un « Nouveau déploiement » : ça générerait une nouvelle URL `/exec` et le webhook pointerait encore vers l'ancienne.
+
+### Le panneau Exécutions montre des erreurs `Script function not found: xxx`
+
+Un déclencheur (trigger) d'une ancienne version du script appelle une fonction qui n'existe plus. Exécute `setup()` : il supprime **tous** les anciens triggers avant de recréer les bons. Tu peux vérifier dans le panneau ⏰ **Déclencheurs** qu'il ne reste que `checkPrices` (30 min) et éventuellement `checkPremiumCabins` (1x/jour).
+
+### Je reçois la même alerte en boucle
+
+Symptôme de la v1 (l'alerte « sous le seuil » se re-déclenchait à chaque passage). Corrigé en v2 : une alerte donnée (record, anomalie ou seuil) n'est jamais renvoyée pour le même prix. Si ça t'arrive en v2, vérifie avec `/aide` que le déploiement sert bien la v2 (voir question précédente).
+
+### `/pause` ne semble pas pris en compte
+
+En v1, un check en cours pouvait écraser la pause (l'état complet était ré-écrit en fin de check). Corrigé en v2 : la config n'est plus jamais écrite par les checks, et l'état pause est relu juste avant chaque envoi d'alerte. Vérifie avec `/liste` que l'état affiché est bien « ⏸️ En pause » — et que tu es en v2.
+
+### `/check` ou `/demarrer` ne renvoie rien (ou « Aucun résultat »)
+
+- L'API Travelpayouts est un **cache** de recherches réelles : une route peu demandée (petit aéroport, destination exotique, dates lointaines) peut n'avoir aucune donnée. Essaie avec une grande ville (`PAR`, `LON`) pour valider que tout fonctionne.
+- Vérifie ton `TRAVELPAYOUTS_TOKEN` : ouvre l'URL d'API à la main avec ton token, la réponse doit contenir `"success":true`.
+- Les filtres `TRIP_DURATION_MIN/MAX` éliminent les offres hors durée de séjour : élargis-les pour tester.
+
+### Erreur « Exception: Service invoked too many times » dans les exécutions
+
+Tu as atteint les quotas Apps Script gratuits (~20 000 requêtes URL Fetch/jour). Avec beaucoup de départs × destinations × devises toutes les 30 min, ça peut arriver. Réduis la voilure : moins d'aéroports (`/retirer`), moins de devises (`/devises EUR`), ou passe le trigger à 60 min dans `setup()`.
+
+### Le module premium ne remonte jamais rien
+
+C'est un scraping non officiel de Google Flights : il peut casser à tout moment si Google change sa page (erreur `structure ds:1 introuvable` dans les journaux). C'est attendu — il est volontairement isolé et son échec n'affecte jamais le suivi principal. Désactive-le avec `PREMIUM_ENABLED: false` si tu ne t'en sers pas.
+
+### Comment repartir de zéro (config, records, historique d'alertes) ?
+
+Dans l'éditeur Apps Script : **Paramètres du projet (⚙) → Propriétés du script** → supprime les propriétés (`CONFIG`, `MINS`, `ALERTED`, `RECENT`, `LAST_RESULT`…), puis ré-exécute `setup()`. La Google Sheet n'est pas touchée — supprime-la de ton Drive si tu veux aussi purger l'historique.
+
+### Est-ce vraiment gratuit ? Y a-t-il un risque avec mes tokens ?
+
+Tout tourne dans les quotas gratuits de Google Apps Script et l'API Data de Travelpayouts est gratuite. Tes tokens restent dans TON projet Apps Script (ne les committe jamais dans un fork public du repo). L'URL `/exec` publique ne permet rien sans ton `chat_id`.
+
 ## Stack
 
 Google Apps Script · [Travelpayouts/Aviasales Data API](https://support.travelpayouts.com/hc/en-us/articles/203956163-Aviasales-Data-API) · Google Sheets · Telegram Bot API — entièrement gratuit.
