@@ -38,9 +38,8 @@ Guide complet pas-à-pas dans [`GUIDE_installation.md`](GUIDE_installation.md) �
 1. Crée un compte gratuit [Travelpayouts](https://www.travelpayouts.com/) et récupère ton token API.
 2. Crée un bot Telegram via [@BotFather](https://t.me/BotFather) et récupère ton token + ton `chat_id`.
 3. Copie `flight_price_watch.gs` dans un nouveau projet [Google Apps Script](https://script.google.com), remplis le bloc `CONFIG_STATIC` avec tes identifiants, exécute `setup()`.
-4. Déploie le script en application web et exécute `registerWebhook()` pour activer le pilotage par Telegram.
 
-Aucune carte bancaire, aucun serveur à gérer, 100 % gratuit dans les limites d'usage personnel.
+C'est tout — tu reçois un message de confirmation sur Telegram. Pas de déploiement, pas de webhook : le script relève tes commandes Telegram toutes les minutes (polling), et toute modification du code prend effet dès la sauvegarde. Aucune carte bancaire, aucun serveur à gérer, 100 % gratuit dans les limites d'usage personnel.
 
 ## Adapter à d'autres destinations / villes de départ
 
@@ -67,15 +66,11 @@ Les destinations, départs et devises se changent directement depuis Telegram (v
 | `/status` | derniers meilleurs prix par destination/devise |
 | `/aide` | rappel des commandes |
 
-## Mettre à jour le script (important)
+Le bot répond en 1 minute maxi (les messages sont relevés toutes les minutes).
 
-Le déploiement Web App **fige le code au moment du déploiement**. Après chaque modification du script :
+## Mettre à jour le script
 
-1. **Déployer → Gérer les déploiements → ✏️ (modifier) → Version : « Nouvelle version » → Déployer.**
-2. L'URL `/exec` ne change pas, le webhook Telegram reste valide.
-3. Vérifie avec `/aide` que la version affichée correspond à `SCRIPT_VERSION` dans le code.
-
-C'est la cause n°1 de « commandes qui ne marchent pas » : un webhook qui pointe vers une ancienne version du code.
+Colle le nouveau code, sauvegarde — les triggers exécutent toujours la dernière version enregistrée, aucun redéploiement. Ré-exécute `setup()` seulement si la mise à jour change les triggers (sans risque : config et historique sont conservés). Vérifie avec `/aide` que la version affichée correspond à `SCRIPT_VERSION`.
 
 ## Limites à connaître
 
@@ -87,21 +82,22 @@ C'est la cause n°1 de « commandes qui ne marchent pas » : un webhook qui poin
 
 ### Le bot ne répond à aucune commande (même `/aide`)
 
-C'est presque toujours l'un de ces trois cas, à vérifier dans l'ordre :
+Rappel : le bot répond en **1 minute maxi** (il relève les messages toutes les minutes, pas instantanément). Si toujours rien après 2 minutes, vérifie dans l'ordre :
 
-1. **Le webhook n'est pas enregistré.** Ouvre dans ton navigateur :
-   `https://api.telegram.org/bot<TON_TOKEN>/getWebhookInfo`
-   - Si `"url":""` → le webhook n'existe pas : remplis `WEB_APP_URL` avec l'URL `/exec` de ton déploiement, puis exécute `registerWebhook()` (le journal doit afficher `"ok":true`).
-   - Si l'URL affichée ne correspond pas à celle visible dans **Déployer → Gérer les déploiements** → même remède.
-   - Regarde aussi `last_error_message` : il te dit pourquoi Telegram n'arrive pas à joindre ton script.
-2. **Le déploiement n'est pas public.** Dans « Gérer les déploiements », « Qui a accès » doit être **Tout le monde** (le script vérifie ton `chat_id` à chaque message, personne d'autre ne peut le piloter).
-3. **Mauvais `chat_id`.** Le script ignore *silencieusement* tout message venant d'un autre chat. Vérifie ton id via `https://api.telegram.org/bot<TON_TOKEN>/getUpdates` après avoir envoyé un message au bot (supprime d'abord le webhook si besoin : `.../deleteWebhook`, puis ré-exécute `registerWebhook()` à la fin).
+1. **Le trigger de polling tourne-t-il ?** Panneau **Exécutions** (⏱) dans l'éditeur Apps Script : tu dois voir une ligne `pollTelegram` par minute, en état « Terminée ». Aucune ligne → ré-exécute `setup()`.
+2. **Que disent les journaux ?** Clique sur le dernier `pollTelegram` → **Journaux Cloud** :
+   - `Message ignoré — chat_id reçu : X ≠ attendu : Y` → ton `TELEGRAM_CHAT_ID` est faux : mets la valeur `X` affichée, sauvegarde, c'est réglé.
+   - `Erreur getUpdates : ... 409 ...` → un ancien webhook bloque encore la relève des messages : ré-exécute `setup()` (il le supprime automatiquement).
+   - `Échec d'envoi Telegram : ...` → la réponse part mais Telegram la refuse ; le message d'erreur JSON te dit pourquoi (token bot invalide, etc.).
+3. **Les tokens sont-ils bons ?** Exécute `setup()` : si tout est correct, tu reçois immédiatement « 🤖 Flight Price Watch installé et actif ! » sur Telegram. Sinon, regarde le journal de `setup`.
 
-**Comment savoir si Telegram atteint ton script :** panneau **Exécutions** (⏱) dans l'éditeur Apps Script. Envoie `/aide` : si aucune ligne `doPost` n'apparaît, le problème est côté webhook/déploiement (cas 1 ou 2) ; si `doPost` apparaît mais que le bot ne répond pas, c'est le `chat_id` (cas 3).
+### Pourquoi du polling et pas un webhook Telegram ?
+
+Apps Script répond à toute requête web par une **redirection HTTP 302** (comportement Google non contournable). Telegram considère ça comme un échec (`Wrong response from the webhook: 302 Found` dans `getWebhookInfo`), marque le webhook en erreur et rejoue les messages : commandes en retard, en double, ou jamais traitées. Le polling (`getUpdates` toutes les minutes) est fiable, ne nécessite **aucun déploiement Web App**, et fait que toute modification du code prend effet dès la sauvegarde. Si tu migres depuis une version webhook de ce projet, exécute simplement `setup()` : il supprime le webhook et installe le polling.
 
 ### Le bot répond, mais avec l'ancien comportement (ou une ancienne version dans `/aide`)
 
-Le déploiement Web App **fige le code au moment du déploiement**. Sauvegarder le fichier ne suffit pas : **Déployer → Gérer les déploiements → ✏️ → Version : « Nouvelle version » → Déployer**. Ne crée PAS un « Nouveau déploiement » : ça générerait une nouvelle URL `/exec` et le webhook pointerait encore vers l'ancienne.
+Vérifie que tu as bien **sauvegardé** le fichier (Cmd/Ctrl+S) — les triggers exécutent la dernière version enregistrée. Si tu viens d'une version ≤ 2.0 (webhook), ré-exécute `setup()` une fois. Si tu avais déployé le script en Web App par le passé, ce déploiement ne sert plus à rien : tu peux le supprimer (« Gérer les déploiements » → archiver), il n'affecte pas le polling.
 
 ### Le panneau Exécutions montre des erreurs `Script function not found: xxx`
 
@@ -109,7 +105,7 @@ Un déclencheur (trigger) d'une ancienne version du script appelle une fonction 
 
 ### Je reçois la même alerte en boucle
 
-Symptôme de la v1 (l'alerte « sous le seuil » se re-déclenchait à chaque passage). Corrigé en v2 : une alerte donnée (record, anomalie ou seuil) n'est jamais renvoyée pour le même prix. Si ça t'arrive en v2, vérifie avec `/aide` que le déploiement sert bien la v2 (voir question précédente).
+Symptôme de la v1 (l'alerte « sous le seuil » se re-déclenchait à chaque passage). Corrigé en v2 : une alerte donnée (record, anomalie ou seuil) n'est jamais renvoyée pour le même prix. Si ça t'arrive encore, vérifie avec `/aide` que tu es bien en v2.1+ (voir question précédente).
 
 ### `/pause` ne semble pas pris en compte
 
@@ -135,7 +131,7 @@ Dans l'éditeur Apps Script : **Paramètres du projet (⚙) → Propriétés du 
 
 ### Est-ce vraiment gratuit ? Y a-t-il un risque avec mes tokens ?
 
-Tout tourne dans les quotas gratuits de Google Apps Script et l'API Data de Travelpayouts est gratuite. Tes tokens restent dans TON projet Apps Script (ne les committe jamais dans un fork public du repo). L'URL `/exec` publique ne permet rien sans ton `chat_id`.
+Tout tourne dans les quotas gratuits de Google Apps Script et l'API Data de Travelpayouts est gratuite. Tes tokens restent dans TON projet Apps Script (ne les committe jamais dans un fork public du repo) et rien n'est exposé sur internet : le script sort chercher ses données, personne ne peut l'appeler de l'extérieur. Seuls les messages venant de ton `chat_id` sont pris en compte.
 
 ## Stack
 

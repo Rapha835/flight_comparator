@@ -33,9 +33,10 @@ vérifie toujours le prix exact avant de payer.
 3. BotFather te donne un **token** (garde-le secret).
 4. Envoie n'importe quel message à ton nouveau bot (cherche-le par son nom
    d'utilisateur et clique "Démarrer").
-5. Dans ton navigateur, ouvre :
-   `https://api.telegram.org/bot<TON_TOKEN>/getUpdates`
-   Cherche `"chat":{"id":123456789` dans la réponse → c'est ton **chat_id**.
+5. Récupère ton **chat_id** : le plus simple est d'envoyer n'importe quoi au
+   bot **@userinfobot** dans Telegram — il répond avec ton id numérique.
+   (Alternative : ouvre `https://api.telegram.org/bot<TON_TOKEN>/getUpdates`
+   dans ton navigateur et cherche `"chat":{"id":123456789` dans la réponse.)
 
 ## Étape 3 — Installer le script
 
@@ -59,35 +60,24 @@ vérifie toujours le prix exact avant de payer.
    - `DEFAULT_ALERT_BELOW` → seuil de prix de départ (dans la 1ère devise)
    - Ces valeurs `DEFAULT_*` ne servent qu'au tout premier lancement —
      ensuite tout se pilote via Telegram.
-   - Laisse `WEB_APP_URL` tel quel pour l'instant, on le remplit à l'étape 5.
 4. Renomme le projet (en haut à gauche) en quelque chose comme
    "Suivi vols Corée".
 5. Dans la barre d'outils, sélectionne la fonction **setup** puis clique
    **Exécuter** (▶). Google va demander d'autoriser le script (accès à
    Google Sheets, Drive, et aux requêtes externes) — accepte.
 
-À ce stade, la surveillance automatique tourne déjà toutes les 30 minutes.
-Il reste une étape pour piloter tout ça depuis Telegram.
+C'est tout. Si les tokens sont bons, tu reçois immédiatement un message
+Telegram « 🤖 Flight Price Watch installé et actif ! ». Envoie `/aide` pour
+vérifier (réponse sous 1 minute).
 
-## Étape 4 — Déployer en Web App (pour activer les commandes Telegram)
-
-1. Dans l'éditeur Apps Script, clique **Déployer** (haut à droite) → **Nouveau
-   déploiement**.
-2. Type de déploiement : **Application Web**.
-3. Réglages :
-   - Exécuter en tant que : **Moi**
-   - Qui a accès : **Tout le monde**
-   *(cette URL n'est utile qu'à Telegram — le script vérifie ton `chat_id` à
-   chaque commande, donc même si quelqu'un la devine, il ne peut rien changer.)*
-4. Clique **Déployer**, autorise si demandé, puis copie l'URL générée
-   (elle se termine par `/exec`).
-5. Retourne dans le code, colle cette URL dans `CONFIG_STATIC.WEB_APP_URL`,
-   sauvegarde.
-6. Sélectionne la fonction **registerWebhook** dans la barre d'outils, clique
-   **Exécuter**. Regarde les logs (Affichage → Journaux) : tu dois voir
-   `"ok":true`.
-
-C'est tout : envoie `/aide` à ton bot Telegram pour vérifier que ça répond.
+**Pas de déploiement Web App, pas de webhook** : le script relève lui-même
+tes messages Telegram toutes les minutes (polling). C'est un choix délibéré —
+Apps Script répond aux webhooks par une redirection HTTP 302 que Telegram
+considère comme un échec, source de bugs pénibles. Le polling est fiable, et
+en bonus **toute modification du code prend effet immédiatement** après
+sauvegarde (les triggers exécutent toujours la dernière version — aucun
+redéploiement, jamais). Seule contrepartie : le bot répond en 1 minute maxi
+au lieu d'instantanément.
 
 ## Commandes Telegram
 
@@ -126,20 +116,14 @@ une devise données :
 
 Chaque alerte inclut le classement des 3 villes de départ les moins chères.
 
-## Mettre à jour le script (à lire absolument)
+## Mettre à jour le script
 
-Le déploiement Web App **fige le code au moment du déploiement** : modifier
-le code dans l'éditeur ne suffit PAS pour les commandes Telegram. Après
-chaque changement :
-
-1. **Déployer → Gérer les déploiements → ✏️ (modifier) → Version :
-   « Nouvelle version » → Déployer.**
-2. L'URL `/exec` ne change pas — inutile de relancer `registerWebhook`.
-3. Envoie `/aide` au bot : la version affichée doit correspondre à
-   `SCRIPT_VERSION` en haut du code.
-
-C'est la cause n°1 de « commandes qui ne répondent pas ou appliquent
-l'ancien comportement ».
+Colle le nouveau code, sauvegarde (Cmd/Ctrl+S) — c'est tout, les triggers
+exécutent toujours la dernière version enregistrée. Ré-exécute `setup()`
+uniquement si la mise à jour ajoute ou renomme un trigger (le changelog le
+précisera) : `setup()` est ré-exécutable sans risque, il ne perd ni ta
+config ni ton historique. Vérifie avec `/aide` que la version affichée
+correspond à `SCRIPT_VERSION` en haut du code.
 
 ## Module complémentaire — éco premium / affaires / première
 
@@ -177,5 +161,4 @@ peu fréquent pour rester discret.
 - Destinations, départs, devises et seuil se pilotent par Telegram. Seuls le
   mois surveillé (`DEPARTURE_MONTH`/`RETURN_MONTH`) et la durée de séjour
   min/max restent dans `CONFIG_STATIC` — modifie-les directement dans le
-  code si besoin, ils sont relus à chaque vérification (mais pense à publier
-  une **nouvelle version** du déploiement, voir section ci-dessus).
+  code et sauvegarde, ils sont relus à chaque vérification.

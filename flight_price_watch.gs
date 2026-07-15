@@ -15,6 +15,17 @@
  *
  * Tourne 100% côté serveur Google (Apps Script), gratuit, rien à héberger.
  *
+ * RÉCEPTION DES COMMANDES TELEGRAM — par POLLING, pas par webhook : le
+ * script interroge lui-même l'API Telegram (getUpdates) toutes les minutes.
+ * Pourquoi pas un webhook ? Apps Script répond aux requêtes web par une
+ * redirection HTTP 302 (comportement Google non contournable), que Telegram
+ * considère comme un échec ("Wrong response from the webhook: 302 Found") :
+ * messages rejoués, retards, comportements erratiques. Le polling est fiable,
+ * et supprime tout besoin de déployer le script en Web App — les triggers
+ * exécutent TOUJOURS la dernière version enregistrée du code, donc les
+ * modifications prennent effet immédiatement, sans redéploiement.
+ * Seule contrepartie : le bot répond en 1 minute maxi au lieu d'instantanément.
+ *
  * Pilotage à distance via Telegram (voir handleCommand_ plus bas) :
  *   /demarrer ICN   → ajoute/active une destination + check immédiat
  *   ICN (tout court) → pareil que /demarrer ICN
@@ -30,12 +41,6 @@
  * jusqu'à ~48h basé sur les recherches réelles des utilisateurs Aviasales).
  * => Toujours revérifier le prix exact avant d'acheter.
  *
- * IMPORTANT — mise à jour du code : le déploiement Web App fige le code au
- * moment du déploiement. Après CHAQUE modification, il faut faire
- * Déployer > Gérer les déploiements > ✏️ > Version : "Nouvelle version".
- * L'URL /exec ne change pas, le webhook Telegram reste valide. Vérifie avec
- * /aide que la version affichée correspond bien à SCRIPT_VERSION ci-dessous.
- *
  * IMPORTANT — codes pays : testé en direct, un code pays sur cette API ne
  * renvoie PAS les prix de tous les aéroports du pays (ex: DE → seulement
  * Francfort). Le script étend donc lui-même chaque code pays via
@@ -46,17 +51,13 @@
  * S'il casse (Google peut changer sa page), le suivi éco continue normalement.
  */
 
-const SCRIPT_VERSION = "2.0";
+const SCRIPT_VERSION = "2.1";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
   TRAVELPAYOUTS_TOKEN: "COLLE_TON_TOKEN_TRAVELPAYOUTS_ICI",
   TELEGRAM_BOT_TOKEN: "COLLE_TON_TOKEN_TELEGRAM_ICI",
   TELEGRAM_CHAT_ID: "COLLE_TON_CHAT_ID_ICI",
-
-  // À remplir APRÈS avoir déployé le script en "Web app" (voir guide) —
-  // nécessaire uniquement pour que registerWebhook() fonctionne.
-  WEB_APP_URL: "COLLE_ICI_L_URL_DE_DEPLOIEMENT_/exec",
 
   DEPARTURE_MONTH: "2026-10", // mois de départ surveillé (YYYY-MM)
   RETURN_MONTH: "2026-10",    // mois de retour surveillé (YYYY-MM)
@@ -139,19 +140,29 @@ const COUNTRY_AIRPORTS = {
 
 /**
  * À exécuter UNE SEULE FOIS manuellement depuis l'éditeur Apps Script.
- * Crée la feuille de log, initialise la config pilotable, installe le
- * trigger toutes les 30 min (48x/jour), et lance un premier check immédiat.
+ * Crée la feuille de log, initialise la config pilotable, installe les
+ * triggers (commandes Telegram toutes les minutes, prix toutes les 30 min),
+ * et lance un premier check immédiat. Ré-exécutable sans risque (idempotent),
+ * y compris après une modification du code.
  */
 function setup() {
   getOrCreateSheet_();
   getConfig_(); // initialise (ou migre) la config si besoin
 
+  // Un webhook actif bloque getUpdates (erreur 409) : on le supprime, et on
+  // purge au passage les vieux messages accumulés pendant qu'il était cassé.
+  const resp = UrlFetchApp.fetch("https://api.telegram.org/bot" + CONFIG_STATIC.TELEGRAM_BOT_TOKEN +
+    "/deleteWebhook?drop_pending_updates=true", { muteHttpExceptions: true });
+  Logger.log("deleteWebhook : " + resp.getContentText());
+  props_().deleteProperty("TG_OFFSET"); // repart de zéro côté messages
+
   // Supprime TOUS les triggers du projet, y compris ceux laissés par
-  // d'anciennes versions du script (ex. pollTelegram_) qui planteraient
-  // en boucle puisque leur fonction n'existe plus.
+  // d'anciennes versions du script, qui planteraient en boucle si leur
+  // fonction n'existe plus.
   ScriptApp.getProjectTriggers().forEach(function (t) {
     ScriptApp.deleteTrigger(t);
   });
+  ScriptApp.newTrigger("pollTelegram").timeBased().everyMinutes(1).create();
   ScriptApp.newTrigger("checkPrices").timeBased().everyMinutes(30).create();
 
   if (CONFIG_STATIC.PREMIUM_ENABLED) {
@@ -159,30 +170,11 @@ function setup() {
   }
 
   checkPrices();
-  Logger.log("Setup v" + SCRIPT_VERSION + " terminé : vérification automatique toutes les 30 minutes (éco).");
+  Logger.log("Setup v" + SCRIPT_VERSION + " terminé : commandes Telegram relevées toutes les minutes, prix vérifiés toutes les 30 minutes.");
   if (CONFIG_STATIC.PREMIUM_ENABLED) {
     Logger.log("Module cabines premium activé : 1 vérification par jour, vers 8h.");
   }
-  Logger.log("Pense à déployer en Web app puis lancer registerWebhook() pour activer les commandes Telegram.");
-}
-
-/**
- * À exécuter UNE SEULE FOIS après avoir déployé le script en "Web app"
- * (Déployer > Nouveau déploiement > Application Web) et rempli
- * CONFIG_STATIC.WEB_APP_URL avec l'URL obtenue. Relie ce déploiement à ton
- * bot Telegram pour que les commandes fonctionnent.
- */
-function registerWebhook() {
-  if (!CONFIG_STATIC.WEB_APP_URL || CONFIG_STATIC.WEB_APP_URL.indexOf("COLLE_ICI") === 0) {
-    Logger.log("Renseigne d'abord CONFIG_STATIC.WEB_APP_URL avec l'URL de déploiement (voir guide).");
-    return;
-  }
-  // drop_pending_updates : purge les vieux messages accumulés (utile si le
-  // bot fonctionnait avant en polling ou si le webhook était cassé un temps).
-  const url = "https://api.telegram.org/bot" + CONFIG_STATIC.TELEGRAM_BOT_TOKEN +
-    "/setWebhook?drop_pending_updates=true&url=" + encodeURIComponent(CONFIG_STATIC.WEB_APP_URL);
-  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  Logger.log(resp.getContentText());
+  replyTelegram_("🤖 Flight Price Watch v" + SCRIPT_VERSION + " installé et actif !\nEnvoie /aide pour la liste des commandes (réponse sous 1 minute).");
 }
 
 /** Arrête toutes les vérifications automatiques (supprime tous les triggers). */
@@ -193,36 +185,42 @@ function stop() {
   Logger.log("Surveillance arrêtée (triggers supprimés).");
 }
 
-/** Point d'entrée appelé par Telegram à chaque message envoyé au bot. */
-function doPost(e) {
+/**
+ * Relève les messages Telegram (trigger toutes les minutes) via getUpdates.
+ * L'offset (TG_OFFSET) est avancé AVANT de traiter chaque message : si une
+ * commande plante, elle n'est pas rejouée en boucle au passage suivant.
+ */
+function pollTelegram() {
   try {
-    const update = JSON.parse(e.postData.contents);
-
-    // Telegram ré-envoie le même update tant qu'il n'a pas reçu de réponse
-    // rapide — on déduplique par update_id pour ne jamais traiter deux fois.
-    if (update.update_id) {
-      const last = Number(props_().getProperty("LAST_UPDATE_ID") || 0);
-      if (update.update_id <= last) return ContentService.createTextOutput("ok");
-      props_().setProperty("LAST_UPDATE_ID", String(update.update_id));
+    const offset = Number(props_().getProperty("TG_OFFSET") || 0);
+    const url = "https://api.telegram.org/bot" + CONFIG_STATIC.TELEGRAM_BOT_TOKEN +
+      "/getUpdates?timeout=0" + (offset ? "&offset=" + offset : "");
+    const json = JSON.parse(UrlFetchApp.fetch(url, { muteHttpExceptions: true }).getContentText());
+    if (!json.ok) {
+      // Erreur 409 = un webhook est encore actif et bloque getUpdates —
+      // ré-exécute setup() pour le supprimer.
+      Logger.log("Erreur getUpdates : " + JSON.stringify(json));
+      return;
     }
 
-    const message = update.message;
-    if (message && message.text) {
+    json.result.forEach(function (update) {
+      props_().setProperty("TG_OFFSET", String(update.update_id + 1));
+      const message = update.message;
+      if (!message || !message.text) return;
       const chatId = String(message.chat.id);
       if (chatId === String(CONFIG_STATIC.TELEGRAM_CHAT_ID)) {
         handleCommand_(message.text.trim());
       } else {
         // Seul ton chat peut piloter le bot — mais on journalise l'id reçu :
         // c'est LE réflexe de debug si le bot ne répond pas (panneau
-        // Exécutions > clique sur le doPost > Journaux Cloud).
+        // Exécutions > clique sur un pollTelegram > Journaux Cloud).
         Logger.log("Message ignoré — chat_id reçu : " + chatId +
           " ≠ attendu : " + CONFIG_STATIC.TELEGRAM_CHAT_ID);
       }
-    }
+    });
   } catch (err) {
-    Logger.log("Erreur doPost: " + err);
+    Logger.log("Erreur pollTelegram: " + err);
   }
-  return ContentService.createTextOutput("ok");
 }
 
 function handleCommand_(text) {
