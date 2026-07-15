@@ -146,9 +146,11 @@ function setup() {
   getOrCreateSheet_();
   getConfig_(); // initialise (ou migre) la config si besoin
 
+  // Supprime TOUS les triggers du projet, y compris ceux laissés par
+  // d'anciennes versions du script (ex. pollTelegram_) qui planteraient
+  // en boucle puisque leur fonction n'existe plus.
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    var fn = t.getHandlerFunction();
-    if (fn === "checkPrices" || fn === "checkPremiumCabins") ScriptApp.deleteTrigger(t);
+    ScriptApp.deleteTrigger(t);
   });
   ScriptApp.newTrigger("checkPrices").timeBased().everyMinutes(30).create();
 
@@ -175,17 +177,18 @@ function registerWebhook() {
     Logger.log("Renseigne d'abord CONFIG_STATIC.WEB_APP_URL avec l'URL de déploiement (voir guide).");
     return;
   }
+  // drop_pending_updates : purge les vieux messages accumulés (utile si le
+  // bot fonctionnait avant en polling ou si le webhook était cassé un temps).
   const url = "https://api.telegram.org/bot" + CONFIG_STATIC.TELEGRAM_BOT_TOKEN +
-    "/setWebhook?url=" + encodeURIComponent(CONFIG_STATIC.WEB_APP_URL);
+    "/setWebhook?drop_pending_updates=true&url=" + encodeURIComponent(CONFIG_STATIC.WEB_APP_URL);
   const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
   Logger.log(resp.getContentText());
 }
 
-/** Arrête toutes les vérifications automatiques (supprime les triggers). */
+/** Arrête toutes les vérifications automatiques (supprime tous les triggers). */
 function stop() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    var fn = t.getHandlerFunction();
-    if (fn === "checkPrices" || fn === "checkPremiumCabins") ScriptApp.deleteTrigger(t);
+    ScriptApp.deleteTrigger(t);
   });
   Logger.log("Surveillance arrêtée (triggers supprimés).");
 }
