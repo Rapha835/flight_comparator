@@ -1,47 +1,52 @@
 /**
- * FLIGHT PRICE WATCH — Corée du Sud
+ * FLIGHT PRICE WATCH v2 — multi-destinations, multi-devises
  *
- * Compare les prix de vols vers Séoul depuis les villes/aéroports européens
- * de ton choix (un code pays comme "FR" s'étend automatiquement vers ses
- * principaux aéroports, un code aéroport comme "CDG" cible précisément),
- * enregistre l'historique dans une Google Sheet, et alerte sur Telegram dès
- * qu'un nouveau prix plancher — toutes villes confondues — apparaît (ou
- * qu'un prix passe sous ton seuil).
+ * Surveille les prix de vols vers PLUSIEURS destinations en parallèle,
+ * dans PLUSIEURS devises (utile pour repérer les erreurs de prix visibles
+ * dans une seule devise), depuis les villes/aéroports de ton choix (un code
+ * pays comme "FR" s'étend automatiquement vers ses principaux aéroports).
  *
- * Tourne 100% côté serveur Google (Apps Script) : pas besoin de garder ton
- * ordinateur, ton navigateur ou une app ouverte. Hébergement gratuit.
+ * Historique dans une Google Sheet, alertes Telegram uniquement quand :
+ *   - un prix bat son record historique (par destination + devise), ou
+ *   - un prix est anormalement bas vs l'historique récent (probable
+ *     erreur de prix : ≤ ANOMALY_RATIO × médiane), ou
+ *   - un prix passe sous ton seuil (/seuil) — une seule fois par baisse,
+ *     jamais deux alertes pour le même prix.
  *
- * Pilotage à distance via commandes Telegram (voir handleCommand_ plus bas) :
- *   /seuil 600        → change le prix qui déclenche une alerte immédiate
- *   /ajouter FR        → ajoute un pays (étendu auto) ou un aéroport précis
- *   /retirer FR        → retire une entrée
- *   /liste              → affiche la config actuelle
- *   /pause               → suspend les vérifications automatiques
- *   /reprendre           → les relance
- *   /status               → dernier meilleur prix trouvé
- *   /aide                  → rappel des commandes
+ * Tourne 100% côté serveur Google (Apps Script), gratuit, rien à héberger.
+ *
+ * Pilotage à distance via Telegram (voir handleCommand_ plus bas) :
+ *   /demarrer ICN   → ajoute/active une destination + check immédiat
+ *   ICN (tout court) → pareil que /demarrer ICN
+ *   /retirer ICN     → retire une destination (ou une ville de départ)
+ *   /ajouter FR       → ajoute un pays ou un aéroport de départ
+ *   /devises EUR USD   → change les devises suivies
+ *   /seuil 600          → seuil d'alerte (dans la 1ère devise)
+ *   /pause /reprendre    → suspend / relance la surveillance
+ *   /check                → force une vérification immédiate
+ *   /liste /status /aide   → config, derniers prix, aide
  *
  * Source de données : Travelpayouts / Aviasales Data API (gratuite, cache
  * jusqu'à ~48h basé sur les recherches réelles des utilisateurs Aviasales).
  * => Toujours revérifier le prix exact avant d'acheter.
  *
- * IMPORTANT : testé en direct, un code pays sur cette API ne renvoie PAS les
- * prix de tous les aéroports du pays — il est résolu vers une seule ville
- * "dominante" (ex: DE → seulement Francfort). C'est pour ça que ce script
- * étend lui-même chaque code pays vers une liste d'aéroports connus
- * (COUNTRY_AIRPORTS ci-dessous) plutôt que de compter sur l'API pour le faire.
+ * IMPORTANT — mise à jour du code : le déploiement Web App fige le code au
+ * moment du déploiement. Après CHAQUE modification, il faut faire
+ * Déployer > Gérer les déploiements > ✏️ > Version : "Nouvelle version".
+ * L'URL /exec ne change pas, le webhook Telegram reste valide. Vérifie avec
+ * /aide que la version affichée correspond bien à SCRIPT_VERSION ci-dessous.
  *
- * MODULE COMPLÉMENTAIRE — cabines premium (checkPremiumCabins) :
- * Travelpayouts ne sait pas filtrer par classe (éco/éco premium/affaires/
- * première). Ce module interroge directement Google Flights (même requête
- * que fait ton navigateur, avec un cookie de consentement pour éviter la
- * page cookies) pour un petit nombre de villes et de dates précises, une
- * fois par jour seulement — volontairement peu fréquent pour rester discret.
- * C'est un scraping non officiel : ça peut casser sans prévenir si Google
- * change sa page. Chaque appel est protégé par un try/catch qui échoue en
- * silence — si ce module tombe en panne, le suivi éco principal (fiable,
- * basé sur Travelpayouts) continue de tourner normalement, sans interruption.
+ * IMPORTANT — codes pays : testé en direct, un code pays sur cette API ne
+ * renvoie PAS les prix de tous les aéroports du pays (ex: DE → seulement
+ * Francfort). Le script étend donc lui-même chaque code pays via
+ * COUNTRY_AIRPORTS ci-dessous.
+ *
+ * MODULE COMPLÉMENTAIRE — cabines premium (checkPremiumCabins) : scraping
+ * non officiel de Google Flights, 1x/jour, entièrement isolé par try/catch.
+ * S'il casse (Google peut changer sa page), le suivi éco continue normalement.
  */
+
+const SCRIPT_VERSION = "2.0";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -50,12 +55,8 @@ const CONFIG_STATIC = {
   TELEGRAM_CHAT_ID: "COLLE_TON_CHAT_ID_ICI",
 
   // À remplir APRÈS avoir déployé le script en "Web app" (voir guide) —
-  // nécessaire uniquement pour que /registerWebhook fonctionne.
+  // nécessaire uniquement pour que registerWebhook() fonctionne.
   WEB_APP_URL: "COLLE_ICI_L_URL_DE_DEPLOIEMENT_/exec",
-
-  // "SEL" couvre Séoul-Incheon (ICN) + Séoul-Gimpo (GMP). Mets "ICN" pour
-  // ne cibler qu'Incheon.
-  DESTINATION: "SEL",
 
   DEPARTURE_MONTH: "2026-10", // mois de départ surveillé (YYYY-MM)
   RETURN_MONTH: "2026-10",    // mois de retour surveillé (YYYY-MM)
@@ -63,23 +64,34 @@ const CONFIG_STATIC = {
   TRIP_DURATION_MIN: 7,   // durée de séjour mini (jours) — filtre les A/R trop courts
   TRIP_DURATION_MAX: 21,  // durée de séjour maxi (jours)
 
-  CURRENCY: "eur",
-
+  // Nom du fichier Google Sheet dans ton Drive (réutilisé s'il existe déjà).
   SHEET_NAME: "Historique prix Corée du Sud",
 
   // Config de DÉPART au tout premier lancement (setup()). Ensuite, tout se
-  // pilote via les commandes Telegram — modifier ces valeurs plus tard n'a
-  // aucun effet, seul l'état stocké dans PropertiesService compte.
+  // pilote via Telegram — modifier ces valeurs plus tard n'a aucun effet,
+  // seul l'état stocké dans PropertiesService compte.
+  // "SEL" couvre Séoul-Incheon (ICN) + Gimpo (GMP) ; "ICN" ne cible qu'Incheon.
+  DEFAULT_DESTINATIONS: ["SEL"],
   DEFAULT_ORIGINS: ["FR", "BE", "NL", "GB", "DE", "ES", "IT", "PT", "CH"],
+  DEFAULT_CURRENCIES: ["EUR", "USD"], // la 1ère est la devise "principale" (seuil)
   DEFAULT_ALERT_BELOW: 650,
+
+  // Détection d'anomalie (probable erreur de prix) : alerte si le meilleur
+  // prix ≤ ANOMALY_RATIO × médiane des RECENT_WINDOW derniers relevés,
+  // à partir de ANOMALY_MIN_SAMPLES relevés accumulés.
+  ANOMALY_RATIO: 0.6,
+  ANOMALY_MIN_SAMPLES: 10,
+  RECENT_WINDOW: 30,
+
+  // Requêtes API envoyées en parallèle par lots (rapide sans matraquer l'API).
+  FETCH_BATCH_SIZE: 15,
 
   // --- Module cabines premium (checkPremiumCabins) ---
   PREMIUM_ENABLED: true,
   PREMIUM_CABINS: ["premium-economy", "business", "first"],
   PREMIUM_MAX_ORIGINS: 5, // limite le nombre de villes interrogées (volume = risque de blocage)
-  // Dates fixes utilisées pour ce module (Google Flights n'a pas de mode
-  // "n'importe quel jour du mois" comme Travelpayouts — une paire de dates
-  // précise par vérification). Ajuste librement.
+  // Google Flights n'a pas de mode "n'importe quel jour du mois" — une paire
+  // de dates précise par vérification. Ajuste librement.
   PREMIUM_SAMPLE_DEPART_DATE: "2026-10-05",
   PREMIUM_SAMPLE_RETURN_DATE: "2026-10-19"
 };
@@ -132,7 +144,7 @@ const COUNTRY_AIRPORTS = {
  */
 function setup() {
   getOrCreateSheet_();
-  getState_(); // initialise l'état s'il n'existe pas encore
+  getConfig_(); // initialise (ou migre) la config si besoin
 
   ScriptApp.getProjectTriggers().forEach(function (t) {
     var fn = t.getHandlerFunction();
@@ -145,7 +157,7 @@ function setup() {
   }
 
   checkPrices();
-  Logger.log("Setup terminé : vérification automatique toutes les 30 minutes (éco).");
+  Logger.log("Setup v" + SCRIPT_VERSION + " terminé : vérification automatique toutes les 30 minutes (éco).");
   if (CONFIG_STATIC.PREMIUM_ENABLED) {
     Logger.log("Module cabines premium activé : 1 vérification par jour, vers 8h.");
   }
@@ -182,6 +194,15 @@ function stop() {
 function doPost(e) {
   try {
     const update = JSON.parse(e.postData.contents);
+
+    // Telegram ré-envoie le même update tant qu'il n'a pas reçu de réponse
+    // rapide — on déduplique par update_id pour ne jamais traiter deux fois.
+    if (update.update_id) {
+      const last = Number(props_().getProperty("LAST_UPDATE_ID") || 0);
+      if (update.update_id <= last) return ContentService.createTextOutput("ok");
+      props_().setProperty("LAST_UPDATE_ID", String(update.update_id));
+    }
+
     const message = update.message;
     if (message && message.text) {
       const chatId = String(message.chat.id);
@@ -202,44 +223,70 @@ function handleCommand_(text) {
   // quand elle est tapée depuis la liste de suggestions — on l'ignore.
   const cmd = parts[0].toLowerCase().split("@")[0];
   const arg = parts.slice(1).join(" ").trim();
-  const state = getState_();
 
-  if (cmd === "/seuil") {
-    const val = parseInt(arg, 10);
-    if (isNaN(val)) { replyTelegram_("Utilise : /seuil 600"); return; }
-    state.alertBelow = val;
-    saveState_(state);
-    replyTelegram_("✅ Seuil d'alerte fixé à " + val + " " + CONFIG_STATIC.CURRENCY.toUpperCase());
+  // "ICN" tout court (3 lettres, sans /) = raccourci pour /demarrer ICN
+  if (cmd.charAt(0) !== "/") {
+    if (/^[a-z]{3}$/.test(cmd) && !arg) { cmdDemarrer_(cmd.toUpperCase()); return; }
+    replyTelegram_("Commande inconnue. Envoie /aide pour la liste des commandes.");
+    return;
+  }
 
-  } else if (cmd === "/ajouter") {
-    if (!arg) { replyTelegram_("Utilise : /ajouter FR (pays) ou /ajouter CDG (aéroport)"); return; }
-    const codeAdd = arg.toUpperCase();
-    if (state.origins.indexOf(codeAdd) === -1) state.origins.push(codeAdd);
-    saveState_(state);
-    replyTelegram_("✅ Ajouté : " + codeAdd + "\n\n" + listOriginsText_(state));
+  const cfg = getConfig_();
 
-  } else if (cmd === "/retirer") {
-    if (!arg) { replyTelegram_("Utilise : /retirer FR"); return; }
-    const codeRemove = arg.toUpperCase();
-    state.origins = state.origins.filter(function (o) { return o !== codeRemove; });
-    saveState_(state);
-    replyTelegram_("🗑️ Retiré : " + codeRemove + "\n\n" + listOriginsText_(state));
-
-  } else if (cmd === "/liste") {
-    replyTelegram_(listOriginsText_(state));
+  if (cmd === "/demarrer" || cmd === "/reprendre") {
+    cmdDemarrer_(arg ? arg.toUpperCase() : null);
 
   } else if (cmd === "/pause") {
-    state.paused = true;
-    saveState_(state);
-    replyTelegram_("⏸️ Vérifications automatiques en pause. Envoie /reprendre pour les relancer.");
+    cfg.paused = true;
+    saveConfig_(cfg);
+    replyTelegram_("⏸️ Vérifications automatiques en pause. Envoie /demarrer (ou /reprendre) pour les relancer.");
 
-  } else if (cmd === "/reprendre") {
-    state.paused = false;
-    saveState_(state);
-    replyTelegram_("▶️ Vérifications automatiques reprises.");
+  } else if (cmd === "/seuil") {
+    const val = parseInt(arg, 10);
+    if (isNaN(val)) { replyTelegram_("Utilise : /seuil 600"); return; }
+    cfg.alertBelow = val;
+    saveConfig_(cfg);
+    replyTelegram_("✅ Seuil d'alerte fixé à " + val + " " + cfg.currencies[0]);
+
+  } else if (cmd === "/ajouter") {
+    if (!arg) { replyTelegram_("Utilise : /ajouter FR (pays) ou /ajouter CDG (aéroport de départ)"); return; }
+    const codeAdd = arg.toUpperCase();
+    if (cfg.origins.indexOf(codeAdd) === -1) cfg.origins.push(codeAdd);
+    saveConfig_(cfg);
+    replyTelegram_("✅ Départ ajouté : " + codeAdd + "\n\n" + listText_(cfg));
+
+  } else if (cmd === "/retirer") {
+    if (!arg) { replyTelegram_("Utilise : /retirer ICN (destination) ou /retirer FR (départ)"); return; }
+    const codeRemove = arg.toUpperCase();
+    if (cfg.destinations.indexOf(codeRemove) !== -1) {
+      if (cfg.destinations.length === 1) { replyTelegram_("⚠️ Impossible : il faut garder au moins une destination."); return; }
+      cfg.destinations = cfg.destinations.filter(function (d) { return d !== codeRemove; });
+      saveConfig_(cfg);
+      replyTelegram_("🗑️ Destination retirée : " + codeRemove + "\n\n" + listText_(cfg));
+    } else if (cfg.origins.indexOf(codeRemove) !== -1) {
+      cfg.origins = cfg.origins.filter(function (o) { return o !== codeRemove; });
+      saveConfig_(cfg);
+      replyTelegram_("🗑️ Départ retiré : " + codeRemove + "\n\n" + listText_(cfg));
+    } else {
+      replyTelegram_("⚠️ " + codeRemove + " n'est ni dans les destinations ni dans les départs.\n\n" + listText_(cfg));
+    }
+
+  } else if (cmd === "/devises") {
+    const curs = arg.toUpperCase().split(/[\s,]+/).filter(function (c) { return /^[A-Z]{3}$/.test(c); });
+    if (curs.length === 0) { replyTelegram_("Utilise : /devises EUR USD (la 1ère est la devise du seuil)"); return; }
+    cfg.currencies = curs;
+    saveConfig_(cfg);
+    replyTelegram_("💱 Devises suivies : " + curs.join(", ") + " (seuil en " + curs[0] + ")");
+
+  } else if (cmd === "/liste") {
+    replyTelegram_(listText_(cfg));
 
   } else if (cmd === "/status") {
-    replyTelegram_(buildStatusText_(state));
+    replyTelegram_(buildStatusText_(cfg));
+
+  } else if (cmd === "/check") {
+    replyTelegram_("🔍 Vérification en cours (" + cfg.destinations.join(", ") + " en " + cfg.currencies.join(", ") + ")…");
+    runCheck_(cfg, cfg.destinations, true);
 
   } else if (cmd === "/aide" || cmd === "/help" || cmd === "/start") {
     replyTelegram_(helpText_());
@@ -249,95 +296,233 @@ function handleCommand_(text) {
   }
 }
 
-function listOriginsText_(state) {
-  const expanded = expandOrigins_(state.origins);
-  return "📍 Entrées surveillées : " + state.origins.join(", ") +
-    "\n(soit " + expanded.length + " aéroport(s) au total : " + expanded.join(", ") + ")" +
-    "\n🎯 Seuil d'alerte : " + (state.alertBelow !== null ? state.alertBelow + " " + CONFIG_STATIC.CURRENCY.toUpperCase() : "désactivé") +
-    "\n" + (state.paused ? "⏸️ En pause" : "▶️ Actif (vérif. toutes les 30 min)");
+/** /demarrer [DEST] : réactive la surveillance, et si DEST est fourni,
+ * l'ajoute aux destinations suivies puis lance un check immédiat dessus. */
+function cmdDemarrer_(dest) {
+  const cfg = getConfig_();
+  let msg = "";
+  if (cfg.paused) {
+    cfg.paused = false;
+    msg += "▶️ Surveillance réactivée.\n";
+  }
+  if (dest) {
+    if (cfg.destinations.indexOf(dest) === -1) {
+      cfg.destinations.push(dest);
+      msg += "🎯 Destination ajoutée : " + dest + "\n";
+    } else {
+      msg += "🎯 " + dest + " est déjà suivie.\n";
+    }
+  }
+  saveConfig_(cfg);
+  if (!msg) msg = "▶️ Surveillance déjà active.\n";
+  replyTelegram_(msg + "\n" + listText_(cfg));
+  if (dest) {
+    replyTelegram_("🔍 Vérification immédiate de " + dest + "…");
+    runCheck_(cfg, [dest], true);
+  }
 }
 
-function buildStatusText_(state) {
-  if (!state.lastResult) return "Aucune vérification effectuée pour l'instant.";
-  const r = state.lastResult;
-  const b = r.best;
-  const top = r.top.map(function (o, i) {
-    return (i + 1) + ". " + o.origin + " — " + o.price + " " + CONFIG_STATIC.CURRENCY.toUpperCase();
-  }).join("\n");
-  return "🕐 Dernière vérification : " + r.checkedAt +
-    "\n🏆 Meilleur prix : " + b.origin + " → " + CONFIG_STATIC.DESTINATION + " — " + b.price + " " + CONFIG_STATIC.CURRENCY.toUpperCase() +
-    "\n📅 " + (b.departure_at ? b.departure_at.substring(0, 10) : "?") + " → " + (b.return_at ? b.return_at.substring(0, 10) : "?") +
-    "\n\n📊 Top villes :\n" + top;
+function listText_(cfg) {
+  const expanded = expandOrigins_(cfg.origins);
+  return "🎯 Destinations : " + cfg.destinations.join(", ") +
+    "\n📍 Départs : " + cfg.origins.join(", ") +
+    "\n(soit " + expanded.length + " aéroport(s) : " + expanded.join(", ") + ")" +
+    "\n💱 Devises : " + cfg.currencies.join(", ") +
+    "\n🎚 Seuil d'alerte : " + (cfg.alertBelow !== null ? cfg.alertBelow + " " + cfg.currencies[0] : "désactivé") +
+    "\n" + (cfg.paused ? "⏸️ En pause" : "▶️ Actif (vérif. toutes les 30 min)") +
+    "\n\n🤖 v" + SCRIPT_VERSION;
+}
+
+function buildStatusText_(cfg) {
+  const lastResult = getJson_("LAST_RESULT", null);
+  if (!lastResult || !lastResult.results || Object.keys(lastResult.results).length === 0) {
+    return "Aucune vérification effectuée pour l'instant. Envoie /check pour en lancer une.\n\n🤖 v" + SCRIPT_VERSION;
+  }
+  const mins = getJson_("MINS", {});
+  const lines = ["🕐 Dernière vérification : " + lastResult.checkedAt, ""];
+  Object.keys(lastResult.results).sort().forEach(function (key) {
+    const r = lastResult.results[key];
+    const b = r.best;
+    const dest = key.split("|")[0];
+    const cur = key.split("|")[1];
+    lines.push("🎯 " + dest + " (" + cur + ") — meilleur : " + b.origin + " à " + b.price + " " + cur +
+      (key in mins ? " · record : " + mins[key] + " " + cur : "") +
+      "\n   📅 " + fmtDate_(b.departure_at) + " → " + fmtDate_(b.return_at) +
+      " · 🔁 " + b.transfers + " escale(s) · 🛫 " + b.airline);
+  });
+  lines.push("", "🤖 v" + SCRIPT_VERSION);
+  return lines.join("\n");
 }
 
 function helpText_() {
-  return "✈️ Commandes disponibles :\n\n" +
-    "/seuil 600 — change le seuil d'alerte (EUR)\n" +
-    "/ajouter FR — ajoute un pays ou un aéroport (ex: CDG)\n" +
-    "/retirer FR — retire une entrée\n" +
-    "/liste — affiche la config actuelle\n" +
+  return "✈️ Commandes disponibles (v" + SCRIPT_VERSION + ") :\n\n" +
+    "/demarrer ICN — ajoute/active une destination + check immédiat\n" +
+    "ICN (tout court) — pareil que /demarrer ICN\n" +
+    "/retirer ICN — retire une destination (ou une ville de départ)\n" +
+    "/ajouter FR — ajoute un pays ou un aéroport de départ (ex: CDG)\n" +
+    "/devises EUR USD — change les devises suivies (la 1ère porte le seuil)\n" +
+    "/seuil 600 — change le seuil d'alerte\n" +
     "/pause — suspend les vérifications\n" +
-    "/reprendre — les relance\n" +
-    "/status — dernier meilleur prix trouvé\n" +
+    "/demarrer ou /reprendre — les relance\n" +
+    "/check — force une vérification immédiate\n" +
+    "/liste — affiche la config actuelle\n" +
+    "/status — derniers meilleurs prix par destination/devise\n" +
     "/aide — ce message\n\n" +
+    "🔔 Alertes : nouveau record, prix anormalement bas (probable erreur de " +
+    "prix), ou passage sous le seuil — jamais deux fois pour le même prix.\n\n" +
     "🥂 Un module séparé vérifie aussi éco premium/affaires/première une " +
-    "fois par jour (voir CONFIG_STATIC.PREMIUM_* dans le code) — pas encore " +
-    "pilotable par commande, à ajuster directement dans le script si besoin.";
+    "fois par jour (voir CONFIG_STATIC.PREMIUM_* dans le code).";
 }
 
 /** Fonction appelée automatiquement par le trigger toutes les 30 minutes. */
 function checkPrices() {
-  const state = getState_();
-  if (state.paused) {
+  const cfg = getConfig_();
+  if (cfg.paused) {
     Logger.log("Vérification ignorée : en pause.");
     return;
   }
+  runCheck_(cfg, cfg.destinations, false);
+}
 
-  const sheet = getOrCreateSheet_();
-  const expanded = expandOrigins_(state.origins);
-  const bestPerAirport = [];
+/**
+ * Cœur du tracker : interroge l'API pour chaque origine × destination ×
+ * devise (par lots parallèles), journalise dans la Sheet, met à jour les
+ * records et envoie les alertes pertinentes.
+ *
+ * N'écrit JAMAIS dans CONFIG : un /pause envoyé pendant un check ne peut
+ * donc plus être écrasé (bug de la v1).
+ *
+ * verbose=true (via /check ou /demarrer) : envoie aussi un résumé Telegram
+ * des meilleurs prix trouvés, même sans alerte.
+ */
+function runCheck_(cfg, destinations, verbose) {
+  const expanded = expandOrigins_(cfg.origins);
 
-  expanded.forEach(function (origin, i) {
-    try {
-      const offers = fetchOffers_(origin, CONFIG_STATIC.DESTINATION);
-      if (offers.length > 0) bestPerAirport.push(offers[0]);
-    } catch (e) {
-      Logger.log("Erreur pour " + origin + " : " + e);
-    }
-    if (i < expanded.length - 1) Utilities.sleep(200);
+  const requests = [];
+  destinations.forEach(function (dest) {
+    cfg.currencies.forEach(function (cur) {
+      expanded.forEach(function (origin) {
+        requests.push({ origin: origin, dest: dest, cur: cur, url: buildApiUrl_(origin, dest, cur) });
+      });
+    });
   });
 
-  if (bestPerAirport.length === 0) {
+  const responses = fetchAllBatched_(requests.map(function (r) { return r.url; }));
+
+  // Meilleure offre par (destination, devise, origine), regroupée par destination+devise.
+  const buckets = {};
+  requests.forEach(function (r, i) {
+    try {
+      const offers = parseOffers_(responses[i]);
+      if (offers.length > 0) {
+        const key = r.dest + "|" + r.cur;
+        if (!buckets[key]) buckets[key] = [];
+        buckets[key].push(offers[0]);
+      }
+    } catch (e) {
+      Logger.log("Erreur pour " + r.origin + "→" + r.dest + " (" + r.cur + ") : " + e);
+    }
+  });
+
+  const keys = Object.keys(buckets);
+  if (keys.length === 0) {
     Logger.log("Aucun résultat cette fois-ci.");
+    if (verbose) replyTelegram_("😕 Aucun résultat trouvé cette fois-ci (cache API vide pour ces routes ?). Réessaie plus tard avec /check.");
     return;
   }
 
-  bestPerAirport.sort(function (a, b) { return a.price - b.price; });
-  const best = bestPerAirport[0]; // meilleur prix toutes villes confondues
-
-  const previousMin = getPreviousMin_(sheet, CONFIG_STATIC.DESTINATION);
+  const mins = getJson_("MINS", {});
+  const alerted = getJson_("ALERTED", {});
+  const recent = getJson_("RECENT", {});
+  const lastResult = getJson_("LAST_RESULT", { results: {} });
+  if (!lastResult.results) lastResult.results = {};
 
   const now = new Date();
-  bestPerAirport.forEach(function (o) {
-    sheet.appendRow([
-      now, o.origin, CONFIG_STATIC.DESTINATION, o.price, CONFIG_STATIC.CURRENCY, o.airline,
-      o.departure_at, o.return_at, o.transfers, buildLink_(o)
-    ]);
+  const rows = [];
+  const summaryLines = [];
+  // Relu au dernier moment : si /pause est arrivé pendant les requêtes,
+  // on enregistre tout mais on n'alerte pas.
+  const pausedNow = !verbose && getConfig_().paused;
+
+  keys.sort().forEach(function (key) {
+    const dest = key.split("|")[0];
+    const cur = key.split("|")[1];
+    const list = buckets[key];
+    list.sort(function (a, b) { return a.price - b.price; });
+    const best = list[0];
+
+    list.forEach(function (o) {
+      rows.push([now, o.origin, dest, cur, o.price, o.airline, o.departure_at, o.return_at, o.transfers, buildLink_(o)]);
+    });
+
+    const hist = recent[key] || [];
+    const med = median_(hist);
+    const prevMin = (key in mins) ? mins[key] : null;
+
+    // Jamais d'alerte au tout premier relevé d'un couple destination/devise :
+    // on enregistre la référence, les alertes commencent au relevé suivant.
+    const isNewLow = prevMin !== null && best.price < prevMin;
+    const isAnomaly = hist.length >= CONFIG_STATIC.ANOMALY_MIN_SAMPLES && med !== null &&
+      best.price <= med * CONFIG_STATIC.ANOMALY_RATIO;
+    const underThreshold = cur === cfg.currencies[0] && cfg.alertBelow !== null &&
+      best.price <= cfg.alertBelow &&
+      (!(key in alerted) || best.price < alerted[key]);
+
+    if (prevMin === null || best.price < prevMin) mins[key] = best.price;
+    hist.push(best.price);
+    if (hist.length > CONFIG_STATIC.RECENT_WINDOW) hist.splice(0, hist.length - CONFIG_STATIC.RECENT_WINDOW);
+    recent[key] = hist;
+
+    lastResult.results[key] = { best: best, top: list.slice(0, 5) };
+
+    summaryLines.push("🎯 " + dest + " (" + cur + ") : " + best.origin + " à " + best.price + " " + cur +
+      " — " + fmtDate_(best.departure_at) + " → " + fmtDate_(best.return_at));
+
+    if (!pausedNow && (isNewLow || isAnomaly || underThreshold)) {
+      sendAlert_(best, dest, cur, list, prevMin, med, { isNewLow: isNewLow, isAnomaly: isAnomaly, underThreshold: underThreshold });
+      alerted[key] = best.price;
+    }
   });
 
-  state.lastResult = {
-    checkedAt: now.toISOString(),
-    best: best,
-    top: bestPerAirport.slice(0, 5)
-  };
-  saveState_(state);
-
-  const isNewLow = previousMin === null || best.price < previousMin;
-  const isUnderThreshold = state.alertBelow !== null && best.price <= state.alertBelow;
-
-  if (isNewLow || isUnderThreshold) {
-    sendTelegramAlert_(best, bestPerAirport, previousMin, isNewLow, isUnderThreshold);
+  if (rows.length > 0) {
+    const sheet = getOrCreateSheet_();
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
   }
+
+  lastResult.checkedAt = now.toISOString();
+  setJson_("MINS", mins);
+  setJson_("ALERTED", alerted);
+  setJson_("RECENT", recent);
+  setJson_("LAST_RESULT", lastResult);
+
+  if (verbose) {
+    replyTelegram_("✅ Vérification terminée :\n\n" + summaryLines.join("\n"));
+  }
+}
+
+function sendAlert_(best, dest, cur, list, prevMin, med, reasons) {
+  let title;
+  if (reasons.isAnomaly) title = "🚨 Prix anormalement bas — probable erreur de prix !";
+  else if (reasons.isNewLow) title = "🔻 Nouveau prix le plus bas !";
+  else title = "🎯 Prix sous ton seuil !";
+
+  const top3 = list.slice(0, 3)
+    .map(function (o, i) { return (i + 1) + ". " + o.origin + " — " + o.price + " " + cur; })
+    .join("\n");
+
+  const msg = title + "\n\n" +
+    "🏆 " + best.origin + " → " + dest + "\n" +
+    "💰 " + best.price + " " + cur +
+    (prevMin !== null ? " (ancien record : " + prevMin + " " + cur + ")" : "") +
+    (reasons.isAnomaly && med !== null ? "\n📉 " + Math.round(100 - best.price / med * 100) + "% sous la médiane récente (" + Math.round(med) + " " + cur + ")" : "") +
+    "\n📅 " + fmtDate_(best.departure_at) + " → " + fmtDate_(best.return_at) + "\n" +
+    "🔁 " + best.transfers + " escale(s)\n" +
+    "🛫 " + best.airline +
+    "\n\n📊 Top villes de départ :\n" + top3 +
+    "\n\n🔗 " + buildLink_(best) +
+    "\n\n⚠️ Prix issu du cache API (~48h) — vérifie avant d'acheter.";
+
+  replyTelegram_(msg);
 }
 
 /** Étend les codes pays de la liste vers leurs aéroports, laisse les codes aéroport tels quels, déduplique. */
@@ -356,7 +541,7 @@ function expandOrigins_(rawOrigins) {
   return out;
 }
 
-function fetchOffers_(origin, destination) {
+function buildApiUrl_(origin, destination, currency) {
   const params = {
     origin: origin,
     destination: destination,
@@ -366,12 +551,27 @@ function fetchOffers_(origin, destination) {
     direct: "false",
     sorting: "price",
     unique: "false",
-    currency: CONFIG_STATIC.CURRENCY,
+    currency: currency.toLowerCase(),
     limit: "30",
     token: CONFIG_STATIC.TRAVELPAYOUTS_TOKEN
   };
-  const url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates?" + toQuery_(params);
-  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  return "https://api.travelpayouts.com/aviasales/v3/prices_for_dates?" + toQuery_(params);
+}
+
+/** Envoie toutes les requêtes par lots parallèles (fetchAll) — bien plus
+ * rapide que la boucle séquentielle de la v1. */
+function fetchAllBatched_(urls) {
+  const out = [];
+  for (let i = 0; i < urls.length; i += CONFIG_STATIC.FETCH_BATCH_SIZE) {
+    const batch = urls.slice(i, i + CONFIG_STATIC.FETCH_BATCH_SIZE)
+      .map(function (u) { return { url: u, muteHttpExceptions: true }; });
+    UrlFetchApp.fetchAll(batch).forEach(function (r) { out.push(r); });
+    if (i + CONFIG_STATIC.FETCH_BATCH_SIZE < urls.length) Utilities.sleep(250);
+  }
+  return out;
+}
+
+function parseOffers_(resp) {
   const json = JSON.parse(resp.getContentText());
   if (!json.success || !json.data) return [];
 
@@ -388,7 +588,8 @@ function fetchOffers_(origin, destination) {
         transfers: o.transfers,
         link: o.link
       };
-    });
+    })
+    .sort(function (a, b) { return a.price - b.price; });
 }
 
 function withinTripDuration_(o) {
@@ -399,41 +600,15 @@ function withinTripDuration_(o) {
   return days >= CONFIG_STATIC.TRIP_DURATION_MIN && days <= CONFIG_STATIC.TRIP_DURATION_MAX;
 }
 
-// Minimum global déjà observé pour cette destination, toutes villes de
-// départ confondues (c'est LE chiffre qui compte pour repérer une bonne affaire).
-function getPreviousMin_(sheet, destination) {
-  const data = sheet.getDataRange().getValues();
-  let min = null;
-  for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    if (row[2] === destination) {
-      const price = row[3];
-      if (min === null || price < min) min = price;
-    }
-  }
-  return min;
+function median_(values) {
+  if (!values || values.length === 0) return null;
+  const sorted = values.slice().sort(function (a, b) { return a - b; });
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-function sendTelegramAlert_(best, bestPerOrigin, previousMin, isNewLow, isUnderThreshold) {
-  const title = isNewLow ? "🔻 Nouveau prix le plus bas (Europe) !" : "🎯 Prix sous ton seuil !";
-  const dep = best.departure_at ? best.departure_at.substring(0, 10) : "?";
-  const ret = best.return_at ? best.return_at.substring(0, 10) : "?";
-
-  const top3 = bestPerOrigin.slice(0, 3)
-    .map(function (o, i) { return (i + 1) + ". " + o.origin + " — " + o.price + " " + CONFIG_STATIC.CURRENCY.toUpperCase(); })
-    .join("\n");
-
-  const msg = title + "\n\n" +
-    "🏆 Meilleure option : " + best.origin + " → " + CONFIG_STATIC.DESTINATION + "\n" +
-    "💶 " + best.price + " " + CONFIG_STATIC.CURRENCY.toUpperCase() + "\n" +
-    "📅 " + dep + " → " + ret + "\n" +
-    "🔁 " + best.transfers + " escale(s)\n" +
-    "🛫 " + best.airline +
-    (previousMin !== null ? "\n(ancien minimum : " + previousMin + " " + CONFIG_STATIC.CURRENCY.toUpperCase() + ")" : "") +
-    "\n\n📊 Top villes de départ :\n" + top3 +
-    "\n\n🔗 " + buildLink_(best);
-
-  replyTelegram_(msg);
+function fmtDate_(iso) {
+  return iso ? String(iso).substring(0, 10) : "?";
 }
 
 function replyTelegram_(text) {
@@ -468,34 +643,38 @@ function checkPremiumCabins() {
   if (!CONFIG_STATIC.PREMIUM_ENABLED) return;
 
   try {
-    const state = getState_();
-    if (state.paused) {
+    const cfg = getConfig_();
+    if (cfg.paused) {
       Logger.log("Module premium ignoré : en pause.");
       return;
     }
 
-    const origins = expandOrigins_(state.origins).slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
+    const cur = cfg.currencies[0];
+    const origins = expandOrigins_(cfg.origins).slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
     const sheet = getOrCreatePremiumSheet_();
     const now = new Date();
-    const results = []; // { cabin, price, origin, airlines, stops }
+    const premiumMins = getJson_("PREMIUM_MINS", {});
+    const results = []; // { cabin, dest, price, origin, airlines, stops }
 
-    CONFIG_STATIC.PREMIUM_CABINS.forEach(function (cabin) {
-      origins.forEach(function (origin) {
-        try {
-          const offers = fetchGoogleFlightsOffers_(origin, CONFIG_STATIC.DESTINATION, cabin);
-          if (offers.length > 0) {
-            const best = offers[0];
-            results.push(best);
-            sheet.appendRow([
-              now, origin, CONFIG_STATIC.DESTINATION, cabin, best.price, CONFIG_STATIC.CURRENCY,
-              best.airlines.join(" + "), best.stops,
-              CONFIG_STATIC.PREMIUM_SAMPLE_DEPART_DATE, CONFIG_STATIC.PREMIUM_SAMPLE_RETURN_DATE
-            ]);
+    cfg.destinations.forEach(function (dest) {
+      CONFIG_STATIC.PREMIUM_CABINS.forEach(function (cabin) {
+        origins.forEach(function (origin) {
+          try {
+            const offers = fetchGoogleFlightsOffers_(origin, dest, cabin, cur);
+            if (offers.length > 0) {
+              const best = offers[0];
+              results.push(best);
+              sheet.appendRow([
+                now, origin, dest, cabin, best.price, cur,
+                best.airlines.join(" + "), best.stops,
+                CONFIG_STATIC.PREMIUM_SAMPLE_DEPART_DATE, CONFIG_STATIC.PREMIUM_SAMPLE_RETURN_DATE
+              ]);
+            }
+          } catch (e) {
+            Logger.log("Module premium — échec pour " + origin + "→" + dest + "/" + cabin + " : " + e);
           }
-        } catch (e) {
-          Logger.log("Module premium — échec pour " + origin + "/" + cabin + " : " + e);
-        }
-        Utilities.sleep(300);
+          Utilities.sleep(300);
+        });
       });
     });
 
@@ -504,17 +683,23 @@ function checkPremiumCabins() {
       return;
     }
 
-    // Regroupe par cabine et alerte sur les nouveaux records de chaque cabine.
-    CONFIG_STATIC.PREMIUM_CABINS.forEach(function (cabin) {
-      const forCabin = results.filter(function (r) { return r.cabin === cabin; });
-      if (forCabin.length === 0) return;
-      forCabin.sort(function (a, b) { return a.price - b.price; });
-      const best = forCabin[0];
-      const previousMin = getPremiumPreviousMin_(sheet, cabin);
-      if (previousMin === null || best.price < previousMin) {
-        sendPremiumAlert_(best, previousMin);
-      }
+    // Alerte sur les nouveaux records par (cabine, destination) — jamais au
+    // tout premier relevé (référence seulement).
+    cfg.destinations.forEach(function (dest) {
+      CONFIG_STATIC.PREMIUM_CABINS.forEach(function (cabin) {
+        const forKey = results.filter(function (r) { return r.cabin === cabin && r.destination === dest; });
+        if (forKey.length === 0) return;
+        forKey.sort(function (a, b) { return a.price - b.price; });
+        const best = forKey[0];
+        const key = cabin + "|" + dest + "|" + cur;
+        const prevMin = (key in premiumMins) ? premiumMins[key] : null;
+        if (prevMin === null || best.price < prevMin) {
+          premiumMins[key] = best.price;
+          if (prevMin !== null) sendPremiumAlert_(best, prevMin, cur);
+        }
+      });
     });
+    setJson_("PREMIUM_MINS", premiumMins);
   } catch (e) {
     // Filet de sécurité global : quoi qu'il arrive, ce module ne doit
     // jamais faire planter le trigger ni affecter le suivi éco.
@@ -522,7 +707,7 @@ function checkPremiumCabins() {
   }
 }
 
-function fetchGoogleFlightsOffers_(origin, destination, cabin) {
+function fetchGoogleFlightsOffers_(origin, destination, cabin, currency) {
   const tfs = buildTfs_(
     [
       { date: CONFIG_STATIC.PREMIUM_SAMPLE_DEPART_DATE, from: origin, to: destination },
@@ -532,7 +717,7 @@ function fetchGoogleFlightsOffers_(origin, destination, cabin) {
   );
 
   const url = "https://www.google.com/travel/flights?tfs=" + encodeURIComponent(tfs) +
-    "&hl=en&curr=" + CONFIG_STATIC.CURRENCY.toUpperCase();
+    "&hl=en&curr=" + currency.toUpperCase();
 
   const resp = UrlFetchApp.fetch(url, {
     method: "get",
@@ -573,42 +758,20 @@ function fetchGoogleFlightsOffers_(origin, destination, cabin) {
   return out;
 }
 
-function getPremiumPreviousMin_(sheet, cabin) {
-  const data = sheet.getDataRange().getValues();
-  let min = null;
-  for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    if (row[3] === cabin) {
-      const price = row[4];
-      if (min === null || price < min) min = price;
-    }
-  }
-  return min;
-}
-
-function sendPremiumAlert_(best, previousMin) {
+function sendPremiumAlert_(best, previousMin, cur) {
   const cabinLabel = { "premium-economy": "Éco premium", "business": "Affaires", "first": "Première" }[best.cabin] || best.cabin;
   const msg = "🥂 Nouveau prix le plus bas — " + cabinLabel + " !\n\n" +
-    "✈️ " + best.origin + " → " + CONFIG_STATIC.DESTINATION + "\n" +
-    "💶 " + best.price + " " + CONFIG_STATIC.CURRENCY.toUpperCase() + " (aller-retour)\n" +
+    "✈️ " + best.origin + " → " + best.destination + "\n" +
+    "💰 " + best.price + " " + cur + " (aller-retour)\n" +
     "🔁 " + best.stops + " escale(s)\n" +
     "🛫 " + best.airlines.join(" + ") +
-    (previousMin !== null ? "\n(ancien minimum : " + previousMin + " " + CONFIG_STATIC.CURRENCY.toUpperCase() + ")" : "") +
+    (previousMin !== null ? "\n(ancien minimum : " + previousMin + " " + cur + ")" : "") +
     "\n\n⚠️ Prix issu d'un scraping non officiel de Google Flights — vérifie sur place avant de réserver.";
   replyTelegram_(msg);
 }
 
 function getOrCreatePremiumSheet_() {
-  let ss;
-  try {
-    ss = SpreadsheetApp.getActiveSpreadsheet();
-  } catch (e) {
-    ss = null;
-  }
-  if (!ss) {
-    const files = DriveApp.getFilesByName(CONFIG_STATIC.SHEET_NAME);
-    ss = files.hasNext() ? SpreadsheetApp.open(files.next()) : SpreadsheetApp.create(CONFIG_STATIC.SHEET_NAME);
-  }
+  const ss = getOrCreateSpreadsheet_();
   let sheet = ss.getSheetByName("Log Premium");
   if (!sheet) {
     sheet = ss.insertSheet("Log Premium");
@@ -678,7 +841,8 @@ function buildTfs_(legs, seat, trip, adults) {
   return Utilities.base64Encode(b);
 }
 
-function getOrCreateSheet_() {
+/** ---- Google Sheet ---- */
+function getOrCreateSpreadsheet_() {
   let ss;
   try {
     ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -689,32 +853,63 @@ function getOrCreateSheet_() {
     const files = DriveApp.getFilesByName(CONFIG_STATIC.SHEET_NAME);
     ss = files.hasNext() ? SpreadsheetApp.open(files.next()) : SpreadsheetApp.create(CONFIG_STATIC.SHEET_NAME);
   }
-  let sheet = ss.getSheetByName("Log");
+  return ss;
+}
+
+// Onglet "Log v2" : ajoute la colonne Devise par rapport à l'ancien "Log"
+// (conservé intact si tu viens de la v1).
+function getOrCreateSheet_() {
+  const ss = getOrCreateSpreadsheet_();
+  let sheet = ss.getSheetByName("Log v2");
   if (!sheet) {
-    sheet = ss.insertSheet("Log");
+    sheet = ss.insertSheet("Log v2");
     sheet.appendRow([
-      "Date vérification", "Origine", "Destination", "Prix", "Devise",
+      "Date vérification", "Origine", "Destination", "Devise", "Prix",
       "Compagnie", "Départ", "Retour", "Escales", "Lien"
     ]);
   }
   return sheet;
 }
 
-/** État pilotable via Telegram, persisté entre les exécutions (PropertiesService). */
-function getState_() {
-  const raw = PropertiesService.getScriptProperties().getProperty("STATE");
-  if (raw) return JSON.parse(raw);
-
-  const initial = {
-    origins: CONFIG_STATIC.DEFAULT_ORIGINS.slice(),
-    alertBelow: CONFIG_STATIC.DEFAULT_ALERT_BELOW,
-    paused: false,
-    lastResult: null
-  };
-  saveState_(initial);
-  return initial;
+/** ---- État persisté (PropertiesService), découpé par responsabilité ----
+ * CONFIG      : écrit uniquement par les commandes Telegram
+ * MINS        : records par "destination|devise" (écrit par runCheck_)
+ * ALERTED     : dernier prix alerté par "destination|devise" (anti-spam)
+ * RECENT      : derniers relevés par "destination|devise" (détection anomalie)
+ * LAST_RESULT : derniers meilleurs prix (pour /status)
+ * Ce découpage élimine la race condition de la v1 où checkPrices ré-écrivait
+ * tout l'état (pause comprise) à la fin de son exécution. */
+function props_() {
+  return PropertiesService.getScriptProperties();
 }
 
-function saveState_(state) {
-  PropertiesService.getScriptProperties().setProperty("STATE", JSON.stringify(state));
+function getJson_(key, fallback) {
+  const raw = props_().getProperty(key);
+  return raw ? JSON.parse(raw) : fallback;
+}
+
+function setJson_(key, value) {
+  props_().setProperty(key, JSON.stringify(value));
+}
+
+function getConfig_() {
+  let cfg = getJson_("CONFIG", null);
+  if (!cfg) {
+    // Migration depuis la v1 (clé STATE unique) si elle existe.
+    const old = getJson_("STATE", null);
+    cfg = {
+      destinations: CONFIG_STATIC.DEFAULT_DESTINATIONS.slice(),
+      origins: old && old.origins ? old.origins : CONFIG_STATIC.DEFAULT_ORIGINS.slice(),
+      currencies: CONFIG_STATIC.DEFAULT_CURRENCIES.slice(),
+      alertBelow: old && old.alertBelow !== undefined ? old.alertBelow : CONFIG_STATIC.DEFAULT_ALERT_BELOW,
+      paused: old ? !!old.paused : false
+    };
+    saveConfig_(cfg);
+    if (old) props_().deleteProperty("STATE");
+  }
+  return cfg;
+}
+
+function saveConfig_(cfg) {
+  setJson_("CONFIG", cfg);
 }

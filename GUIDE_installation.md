@@ -46,13 +46,19 @@ vérifie toujours le prix exact avant de payer.
    - `TRAVELPAYOUTS_TOKEN` → le token de l'étape 1
    - `TELEGRAM_BOT_TOKEN` → le token de l'étape 2
    - `TELEGRAM_CHAT_ID` → le chat_id de l'étape 2
-   - `DEFAULT_ORIGINS` → config de départ, déjà pré-remplie avec des codes
+   - `DEFAULT_DESTINATIONS` → destinations de départ (ex. `["SEL"]` = Séoul,
+     ou `["ICN"]` pour ne cibler qu'Incheon) — ensuite tu en ajoutes/retires
+     via Telegram (`/demarrer ICN`, `/retirer ICN`)
+   - `DEFAULT_ORIGINS` → villes de départ, déjà pré-remplies avec des codes
      pays (`"FR"`, `"BE"`, `"NL"`, `"GB"`, `"DE"`, `"ES"`, `"IT"`, `"PT"`,
      `"CH"`) — chaque pays s'étend automatiquement vers ses aéroports
-     principaux (voir `COUNTRY_AIRPORTS` juste en dessous dans le code).
-     Ensuite tu ajusteras tout via Telegram, cette liste ne sert qu'au tout
-     premier lancement.
-   - `DEFAULT_ALERT_BELOW` → seuil de prix (EUR) de départ
+     principaux (voir `COUNTRY_AIRPORTS` juste en dessous dans le code)
+   - `DEFAULT_CURRENCIES` → devises suivies, ex. `["EUR", "USD"]` — suivre
+     plusieurs devises aide à repérer les erreurs de prix visibles dans une
+     seule devise ; la 1ère est celle du seuil d'alerte
+   - `DEFAULT_ALERT_BELOW` → seuil de prix de départ (dans la 1ère devise)
+   - Ces valeurs `DEFAULT_*` ne servent qu'au tout premier lancement —
+     ensuite tout se pilote via Telegram.
    - Laisse `WEB_APP_URL` tel quel pour l'instant, on le remplit à l'étape 5.
 4. Renomme le projet (en haut à gauche) en quelque chose comme
    "Suivi vols Corée".
@@ -85,26 +91,55 @@ C'est tout : envoie `/aide` à ton bot Telegram pour vérifier que ça répond.
 
 ## Commandes Telegram
 
-- `/seuil 600` — change le seuil qui déclenche une alerte immédiate (EUR)
-- `/ajouter FR` — ajoute un pays (étendu automatiquement) ou un aéroport
-  précis, ex. `/ajouter CDG`
-- `/retirer FR` — retire une entrée de la liste
-- `/liste` — affiche les entrées surveillées, les aéroports réellement
-  interrogés, le seuil actuel et l'état (actif/pause)
+- `/demarrer ICN` — ajoute ICN aux destinations suivies (et réactive la
+  surveillance si elle était en pause) + vérification immédiate de cette
+  destination. Envoyer juste `ICN` (3 lettres, sans `/`) fait pareil.
+- `/retirer ICN` — retire une destination (ou une ville de départ si le code
+  correspond à un départ)
+- `/ajouter FR` — ajoute un pays (étendu automatiquement) ou un aéroport de
+  départ précis, ex. `/ajouter CDG`
+- `/devises EUR USD` — change les devises suivies ; la 1ère porte le seuil
+- `/seuil 600` — change le seuil qui déclenche une alerte immédiate
 - `/pause` / `/reprendre` — suspend ou relance les vérifications automatiques
-- `/status` — dernier meilleur prix trouvé, sans attendre le prochain passage
-- `/aide` — rappel de toutes les commandes
+- `/check` — force une vérification immédiate et renvoie un résumé des
+  meilleurs prix par destination/devise
+- `/liste` — affiche destinations, départs, devises, seuil, état
+  (actif/pause) et la version du script
+- `/status` — derniers meilleurs prix trouvés, sans attendre le prochain passage
+- `/aide` — rappel de toutes les commandes (+ version du script)
 
 ## Vérifier / consulter
 
 Un Google Sheet nommé **"Historique prix Corée du Sud"** est créé
-automatiquement dans ton Drive. À chaque passage (toutes les 30 min), le
-script enregistre le meilleur prix trouvé pour CHAQUE aéroport surveillé —
-tableau comparatif complet, qui s'accumule tout seul jusqu'en octobre.
+automatiquement dans ton Drive (onglet **"Log v2"**). À chaque passage
+(toutes les 30 min), le script enregistre le meilleur prix trouvé pour CHAQUE
+aéroport surveillé, par destination et par devise — tableau comparatif
+complet qui s'accumule tout seul.
 
-Tu reçois un message Telegram seulement quand le meilleur prix toutes villes
-confondues bat son record, ou qu'un prix passe sous ton seuil — avec le
-classement des 3 villes de départ les moins chères à ce moment-là.
+Tu reçois un message Telegram **seulement** quand, pour une destination et
+une devise données :
+- le meilleur prix bat son record historique, ou
+- le prix est anormalement bas par rapport aux ~30 derniers relevés
+  (≤ 60 % de la médiane → probable **erreur de prix**), ou
+- le prix passe sous ton seuil — une seule fois par baisse, jamais deux
+  alertes pour le même prix.
+
+Chaque alerte inclut le classement des 3 villes de départ les moins chères.
+
+## Mettre à jour le script (à lire absolument)
+
+Le déploiement Web App **fige le code au moment du déploiement** : modifier
+le code dans l'éditeur ne suffit PAS pour les commandes Telegram. Après
+chaque changement :
+
+1. **Déployer → Gérer les déploiements → ✏️ (modifier) → Version :
+   « Nouvelle version » → Déployer.**
+2. L'URL `/exec` ne change pas — inutile de relancer `registerWebhook`.
+3. Envoie `/aide` au bot : la version affichée doit correspondre à
+   `SCRIPT_VERSION` en haut du code.
+
+C'est la cause n°1 de « commandes qui ne répondent pas ou appliquent
+l'ancien comportement ».
 
 ## Module complémentaire — éco premium / affaires / première
 
@@ -135,10 +170,12 @@ peu fréquent pour rester discret.
 
 ## Pour arrêter ou ajuster
 
-- `/pause` sur Telegram suspend les deux modules (éco et premium) sans tout démonter.
+- `/pause` sur Telegram suspend les deux modules (éco et premium) sans tout
+  démonter ; `/demarrer` ou `/reprendre` relance.
 - Pour arrêter complètement (supprimer les triggers) : exécute la fonction
   **stop** dans l'éditeur Apps Script.
-- Le mois surveillé, la destination, la durée de séjour min/max et la devise
-  restent dans `CONFIG_STATIC` (pas pilotables par Telegram pour l'instant) —
-  modifie-les directement dans le code si besoin, aucune réinstallation
-  nécessaire, ils sont relus à chaque vérification.
+- Destinations, départs, devises et seuil se pilotent par Telegram. Seuls le
+  mois surveillé (`DEPARTURE_MONTH`/`RETURN_MONTH`) et la durée de séjour
+  min/max restent dans `CONFIG_STATIC` — modifie-les directement dans le
+  code si besoin, ils sont relus à chaque vérification (mais pense à publier
+  une **nouvelle version** du déploiement, voir section ci-dessus).
