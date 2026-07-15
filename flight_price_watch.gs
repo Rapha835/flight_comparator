@@ -211,8 +211,13 @@ function doPost(e) {
       const chatId = String(message.chat.id);
       if (chatId === String(CONFIG_STATIC.TELEGRAM_CHAT_ID)) {
         handleCommand_(message.text.trim());
+      } else {
+        // Seul ton chat peut piloter le bot — mais on journalise l'id reçu :
+        // c'est LE réflexe de debug si le bot ne répond pas (panneau
+        // Exécutions > clique sur le doPost > Journaux Cloud).
+        Logger.log("Message ignoré — chat_id reçu : " + chatId +
+          " ≠ attendu : " + CONFIG_STATIC.TELEGRAM_CHAT_ID);
       }
-      // messages venant d'un autre chat_id que le tien sont silencieusement ignorés
     }
   } catch (err) {
     Logger.log("Erreur doPost: " + err);
@@ -616,11 +621,17 @@ function fmtDate_(iso) {
 
 function replyTelegram_(text) {
   const url = "https://api.telegram.org/bot" + CONFIG_STATIC.TELEGRAM_BOT_TOKEN + "/sendMessage";
-  UrlFetchApp.fetch(url, {
+  const resp = UrlFetchApp.fetch(url, {
     method: "post",
     payload: { chat_id: CONFIG_STATIC.TELEGRAM_CHAT_ID, text: text },
     muteHttpExceptions: true
   });
+  const body = resp.getContentText();
+  if (body.indexOf('"ok":true') === -1) {
+    // Visible dans Exécutions > Journaux Cloud — typiquement "chat not found"
+    // si TELEGRAM_CHAT_ID est faux, ou "unauthorized" si le token bot est faux.
+    Logger.log("Échec d'envoi Telegram : " + body);
+  }
 }
 
 function buildLink_(o) {
