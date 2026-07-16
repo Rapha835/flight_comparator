@@ -60,7 +60,7 @@ Tout se règle depuis Telegram : `/config` relance l'assistant complet (8 questi
 | `/duree 14 21` | durée du séjour min/max (nuits) |
 | `/cabines eco affaires` | type de billet suivi (éco, éco premium, affaires, first, toutes) |
 | `/escales 1` | escales maxi par trajet (`/escales non` = libre) |
-| `/budget 700` | prix maxi dans la devise principale (`/budget non` = aucun) |
+| `/budget 700` | budget repère : les prix au-dessus restent affichés mais marqués ⚠️ (`/budget non` = aucun) |
 | `/devises EUR USD` | devises suivies (la 1ère est la principale) |
 | `/seuil 40` | alerte si un prix tombe 40 % sous la moyenne relevée |
 | `/pause` / `/reprendre` | suspend ou relance la surveillance |
@@ -70,7 +70,7 @@ Tout se règle depuis Telegram : `/config` relance l'assistant complet (8 questi
 | `/status` | derniers prix éco + cabines premium |
 | `/aide` | rappel des commandes |
 
-Le bot répond en 1 minute maxi (les messages sont relevés toutes les minutes).
+Le bot répond en 1 minute maxi (les messages sont relevés toutes les minutes). Les prix sont **par personne, aller-retour**. Si ta config est très large (beaucoup de destinations × départs), la vérification passe automatiquement à 1x/heure pour rester dans les quotas gratuits — `/liste` l'indique.
 
 **Filtres FlightList non couverts** : bagages, heure de départ, durée de vol maxi et temps d'escale maxi — l'API gratuite Travelpayouts n'expose pas ces informations.
 

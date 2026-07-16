@@ -1,5 +1,5 @@
 /**
- * FLIGHT PRICE WATCH v2.3 — multi-destinations, multi-devises, fenêtres de
+ * FLIGHT PRICE WATCH v2.4 — multi-destinations, multi-devises, fenêtres de
  * dates façon FlightList, onboarding guidé par questions dans Telegram.
  *
  * Surveille les prix de vols vers PLUSIEURS destinations en parallèle, dans
@@ -51,7 +51,7 @@
  * peut changer sa page), le suivi éco continue normalement.
  */
 
-const SCRIPT_VERSION = "2.3";
+const SCRIPT_VERSION = "2.4";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -80,6 +80,14 @@ const CONFIG_STATIC = {
 
   // Requêtes API envoyées en parallèle par lots (rapide sans matraquer l'API).
   FETCH_BATCH_SIZE: 15,
+
+  // Devises secondaires : interrogées uniquement pour les N origines les
+  // moins chères de chaque destination (gros gain de quota, même résultat).
+  SECONDARY_TOP_ORIGINS: 5,
+  // Au-delà de ~ce volume de requêtes par vérification, la cadence passe
+  // automatiquement à 1x/heure pour rester dans les quotas gratuits Google
+  // (~20 000 requêtes/jour). Affiché dans /liste.
+  LARGE_CONFIG_REQUESTS: 450,
 
   // --- Module cabines avant (éco premium / affaires / first) ---
   // Les cabines suivies se choisissent dans l'onboarding ou via /cabines.
@@ -340,7 +348,7 @@ function handleCommand_(text) {
     replyTelegram_(buildStatusText_(cfg));
 
   } else if (cmd === "/check") {
-    replyTelegram_("🔍 Je vérifie " + cfg.destinations.join(" + ") + "… (~30 s)");
+    replyTelegram_("🔍 Je vérifie " + cfg.destinations.join(" + ") + "… (" + etaText_(cfg, cfg.destinations.length) + ")");
     runCheck_(cfg, cfg.destinations, true);
 
   } else if (cmd === "/premium") {
@@ -370,7 +378,7 @@ function cmdDemarrer_(dest) {
 
   if (dest) {
     replyTelegram_((isNew ? "🎯 " + dest + " ajoutée !" : "🎯 " + dest + " déjà suivie.") +
-      (wasPaused ? " Surveillance réactivée." : "") + " Je vérifie… (~30 s)");
+      (wasPaused ? " Surveillance réactivée." : "") + " Je vérifie… (" + etaText_(cfg, 1) + ")");
     runCheck_(cfg, [dest], true);
   } else {
     replyTelegram_(wasPaused ? "▶️ Surveillance réactivée." : "▶️ Surveillance déjà active.");
@@ -509,7 +517,7 @@ function wizardAnswer_(text) {
     replyTelegram_("✅ Noté !\n\n" + wizardQuestion_(next, cfg));
   } else {
     props_().deleteProperty("WIZARD");
-    replyTelegram_("🎉 Configuration terminée !\n\n" + listText_(cfg) + "\n\n🔍 Première vérification… (~30 s)");
+    replyTelegram_("🎉 Configuration terminée !\n\n" + listText_(cfg) + "\n\n🔍 Première vérification… (" + etaText_(cfg, cfg.destinations.length) + ")");
     runCheck_(cfg, cfg.destinations, true);
   }
 }
@@ -603,7 +611,7 @@ function listText_(cfg) {
     (cfg.budget !== null ? " · 💰 max " + cfg.budget + " " + cfg.currencies[0] : "") + "\n" +
     "💱 " + cfg.currencies.join(", ") + "\n" +
     "🚨 Alerte : record battu, ou prix " + cfg.alertPct + "% sous la moyenne\n" +
-    (cfg.paused ? "⏸️ En pause" : "▶️ Actif (toutes les 30 min)") + " — v" + SCRIPT_VERSION;
+    (cfg.paused ? "⏸️ En pause" : "▶️ Actif (" + cadenceLabel_(cfg) + ")") + " — v" + SCRIPT_VERSION;
 }
 
 function buildStatusText_(cfg) {
@@ -676,7 +684,38 @@ function checkPrices() {
     Logger.log("Vérification éco ignorée : billets suivis = " + cfg.cabins.join(", ") + " (voir /cabines).");
     return;
   }
+  // Config large (beaucoup de destinations × départs) : une vérification sur
+  // deux est sautée pour rester dans les quotas gratuits (≈20 000 req/jour).
+  if (estimateRequests_(cfg) > CONFIG_STATIC.LARGE_CONFIG_REQUESTS) {
+    const tick = props_().getProperty("CHECK_TICK") === "1" ? "0" : "1";
+    props_().setProperty("CHECK_TICK", tick);
+    if (tick === "0") {
+      Logger.log("Config large : vérification sautée (cadence effective 1x/heure).");
+      return;
+    }
+  }
   runCheck_(cfg, cfg.destinations, false);
+}
+
+/** Volume approximatif de requêtes API pour une vérification complète. */
+function estimateRequests_(cfg) {
+  const combos = monthsInWindow_(cfg.departWindow).slice(0, 3).length *
+    monthsInWindow_(cfg.returnWindow).slice(0, 3).length;
+  return cfg.destinations.length * combos *
+    (expandOrigins_(cfg.origins).length + (cfg.currencies.length - 1) * CONFIG_STATIC.SECONDARY_TOP_ORIGINS);
+}
+
+function cadenceLabel_(cfg) {
+  return estimateRequests_(cfg) > CONFIG_STATIC.LARGE_CONFIG_REQUESTS
+    ? "toutes les 60 min — config large" : "toutes les 30 min";
+}
+
+/** Durée estimée d'une vérification, pour les messages « Je vérifie… ». */
+function etaText_(cfg, destCount) {
+  const perDest = estimateRequests_(cfg) / cfg.destinations.length;
+  const batches = Math.ceil(perDest * destCount / CONFIG_STATIC.FETCH_BATCH_SIZE);
+  const secs = Math.max(10, Math.round(batches * 1.5) + 3);
+  return secs > 90 ? "~" + Math.ceil(secs / 60) + " min" : "~" + secs + " s";
 }
 
 /**
@@ -697,37 +736,50 @@ function runCheck_(cfg, destinations, verbose) {
   // par les fenêtres, puis on filtre finement par date exacte.
   const departMonths = monthsInWindow_(cfg.departWindow).slice(0, 3);
   const returnMonths = monthsInWindow_(cfg.returnWindow).slice(0, 3);
+  const mainCur = cfg.currencies[0];
+  const buckets = {};
 
+  // Passe 1 : devise principale, toutes les origines.
   const requests = [];
   destinations.forEach(function (dest) {
-    cfg.currencies.forEach(function (cur) {
-      expanded.forEach(function (origin) {
-        departMonths.forEach(function (dm) {
-          returnMonths.forEach(function (rm) {
-            if (rm < dm) return;
-            requests.push({ origin: origin, dest: dest, cur: cur, url: buildApiUrl_(origin, dest, cur, dm, rm) });
-          });
+    expanded.forEach(function (origin) {
+      departMonths.forEach(function (dm) {
+        returnMonths.forEach(function (rm) {
+          if (rm < dm) return;
+          requests.push({ origin: origin, dest: dest, cur: mainCur, url: buildApiUrl_(origin, dest, mainCur, dm, rm) });
         });
       });
     });
   });
+  collectBest_(requests, cfg, buckets);
 
-  const responses = fetchAllBatched_(requests.map(function (r) { return r.url; }));
-
-  // Meilleure offre par requête, regroupée par destination+devise.
-  const buckets = {};
-  requests.forEach(function (r, i) {
-    try {
-      const offers = parseOffers_(responses[i], cfg, r.cur);
-      if (offers.length > 0) {
-        const key = r.dest + "|" + r.cur;
-        if (!buckets[key]) buckets[key] = [];
-        buckets[key].push(offers[0]);
-      }
-    } catch (e) {
-      Logger.log("Erreur pour " + r.origin + "→" + r.dest + " (" + r.cur + ") : " + e);
-    }
-  });
+  // Passe 2 : devises secondaires, uniquement pour les origines les moins
+  // chères de chaque destination — comparer les devises n'a d'intérêt que
+  // sur les meilleures routes, et ça divise le volume de requêtes.
+  if (cfg.currencies.length > 1) {
+    const requests2 = [];
+    destinations.forEach(function (dest) {
+      const mainList = buckets[dest + "|" + mainCur];
+      if (!mainList) return;
+      const topOrigins = [];
+      mainList.slice().sort(function (a, b) { return a.price - b.price; }).forEach(function (o) {
+        if (topOrigins.indexOf(o.origin) === -1 && topOrigins.length < CONFIG_STATIC.SECONDARY_TOP_ORIGINS) {
+          topOrigins.push(o.origin);
+        }
+      });
+      cfg.currencies.slice(1).forEach(function (cur) {
+        topOrigins.forEach(function (origin) {
+          departMonths.forEach(function (dm) {
+            returnMonths.forEach(function (rm) {
+              if (rm < dm) return;
+              requests2.push({ origin: origin, dest: dest, cur: cur, url: buildApiUrl_(origin, dest, cur, dm, rm) });
+            });
+          });
+        });
+      });
+    });
+    collectBest_(requests2, cfg, buckets);
+  }
 
   const keys = Object.keys(buckets);
   if (keys.length === 0) {
@@ -790,9 +842,13 @@ function runCheck_(cfg, destinations, verbose) {
       // Résumé compact : top 3 dans la devise principale, meilleur prix seul
       // dans les autres devises.
       if (cur === cfg.currencies[0]) {
-        summaryLines.push("🎯 " + dest + " (" + cur + ")");
+        const overBudget = cfg.budget !== null && best.price > cfg.budget;
+        summaryLines.push("🎯 " + dest + " (" + cur + ")" +
+          (overBudget ? " — ⚠️ au-dessus de ton budget (" + cfg.budget + ")" : ""));
         list.slice(0, 3).forEach(function (o, i) {
-          summaryLines.push((i + 1) + ". " + o.origin + " " + o.price + " · " + fmtDate_(o.departure_at) + "→" + fmtDate_(o.return_at) +
+          summaryLines.push((i + 1) + ". " + o.origin + " " + o.price +
+            (cfg.budget !== null && o.price > cfg.budget ? " ⚠️" : "") +
+            " · " + fmtDate_(o.departure_at) + "→" + fmtDate_(o.return_at) +
             " · " + o.transfers + " esc. · " + o.airline);
         });
       } else {
@@ -800,7 +856,7 @@ function runCheck_(cfg, destinations, verbose) {
       }
 
       if (!pausedNow && (isNewLow || isAnomaly)) {
-        sendAlert_(best, dest, cur, prevMin, med, { isNewLow: isNewLow, isAnomaly: isAnomaly });
+        sendAlert_(best, dest, cur, prevMin, med, { isNewLow: isNewLow, isAnomaly: isAnomaly }, cfg);
         alerted[key] = best.price;
       }
     });
@@ -824,7 +880,7 @@ function runCheck_(cfg, destinations, verbose) {
   }
 }
 
-function sendAlert_(best, dest, cur, prevMin, med, reasons) {
+function sendAlert_(best, dest, cur, prevMin, med, reasons, cfg) {
   const title = reasons.isAnomaly ? "🚨 Probable ERREUR DE PRIX — " + dest + " !" : "🔻 Record battu — " + dest + " !";
   const pctLine = (reasons.isAnomaly && med !== null)
     ? "\n📉 " + Math.round(100 - best.price / med * 100) + "% sous la moyenne (" + Math.round(med) + " " + cur + ")"
@@ -834,6 +890,8 @@ function sendAlert_(best, dest, cur, prevMin, med, reasons) {
     "💰 " + best.price + " " + cur + (prevMin !== null ? " (record précédent : " + prevMin + ")" : "") + pctLine + "\n" +
     "🛫 " + best.origin + " → " + dest + " · " + fmtDate_(best.departure_at) + "→" + fmtDate_(best.return_at) +
     " · " + best.transfers + " esc. · " + best.airline + "\n\n" +
+    (cfg.budget !== null && cur === cfg.currencies[0] && best.price > cfg.budget
+      ? "💸 Au-dessus de ton budget (" + cfg.budget + " " + cur + ")\n" : "") +
     "🔗 " + buildLink_(best) + "\n" +
     "⚠️ Prix issu du cache API (~48h) — vérifie avant d'acheter.";
 
@@ -884,6 +942,24 @@ function buildApiUrl_(origin, destination, currency, departMonth, returnMonth) {
     token: CONFIG_STATIC.TRAVELPAYOUTS_TOKEN
   };
   return "https://api.travelpayouts.com/aviasales/v3/prices_for_dates?" + toQuery_(params);
+}
+
+/** Exécute un lot de requêtes et range la meilleure offre de chacune dans
+ * buckets["destination|devise"]. */
+function collectBest_(requests, cfg, buckets) {
+  const responses = fetchAllBatched_(requests.map(function (r) { return r.url; }));
+  requests.forEach(function (r, i) {
+    try {
+      const offers = parseOffers_(responses[i], cfg, r.cur);
+      if (offers.length > 0) {
+        const key = r.dest + "|" + r.cur;
+        if (!buckets[key]) buckets[key] = [];
+        buckets[key].push(offers[0]);
+      }
+    } catch (e) {
+      Logger.log("Erreur pour " + r.origin + "→" + r.dest + " (" + r.cur + ") : " + e);
+    }
+  });
 }
 
 /** Envoie toutes les requêtes par lots parallèles (fetchAll) — bien plus
@@ -937,9 +1013,9 @@ function matchesCriteria_(o, cfg, currency) {
     if (o.return_transfers !== undefined && o.return_transfers > cfg.maxTransfers) return false;
   }
 
-  // Le budget est exprimé dans la devise principale uniquement.
-  if (cfg.budget !== null && currency === cfg.currencies[0] && o.price > cfg.budget) return false;
-
+  // Le budget n'est volontairement PAS un filtre dur : masquer les résultats
+  // au-dessus du budget cacherait la réalité du marché (et les affichages
+  // deviendraient vides sans explication). Il est annoté ⚠️ dans les résumés.
   return true;
 }
 
@@ -984,7 +1060,9 @@ function replyTelegram_(text) {
 }
 
 function buildLink_(o) {
-  return "https://www.aviasales.com/search/" + o.link;
+  // L'API renvoie déjà un chemin complet ("/search/…") — ne pas re-préfixer.
+  const path = String(o.link || "");
+  return "https://www.aviasales.com" + (path.charAt(0) === "/" ? path : "/search/" + path);
 }
 
 function toQuery_(params) {

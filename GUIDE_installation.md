@@ -95,7 +95,8 @@ au lieu d'instantanément.
   affaires, first, toutes) ; l'éco est vérifiée toutes les 30 min, les
   cabines avant 1x/jour + `/premium`
 - `/escales 1` — escales maxi par trajet (`/escales non` = peu importe)
-- `/budget 700` — prix maxi, dans la devise principale (`/budget non` = aucun)
+- `/budget 700` — budget repère dans la devise principale : les prix
+  au-dessus restent affichés, marqués ⚠️ (`/budget non` = aucun)
 - `/devises EUR USD` — devises suivies ; la 1ère est la principale
 - `/seuil 40` — alerte si un prix tombe 40 % sous la moyenne relevée
 - `/pause` / `/reprendre` — suspend ou relance les vérifications automatiques
@@ -112,6 +113,11 @@ Un Google Sheet est créé automatiquement dans ton Drive (onglet **"Log v2"**,
 + **"Log Premium"** pour les cabines). À chaque passage (toutes les 30 min),
 le script enregistre les meilleurs prix par aéroport de départ, destination
 et devise — tableau comparatif complet qui s'accumule tout seul.
+
+Tous les prix sont **par personne, aller-retour complet**. Si ta config est
+très large (beaucoup de destinations × aéroports de départ), les
+vérifications passent automatiquement à 1x/heure pour rester dans les
+quotas gratuits Google — `/liste` l'indique.
 
 Tu reçois un message Telegram **seulement** quand, pour une destination et
 une devise données :
