@@ -62,8 +62,9 @@ C'est tout. Si les tokens sont bons, le bot t'écrit immédiatement sur
 Telegram et lance **l'assistant de configuration : 8 questions rapides**
 (destinations, zone de départ, fenêtre de dates aller, fenêtre retour,
 durée du séjour en nuits, type de billet — éco / éco premium / affaires /
-first —, escales max, budget max — avec en repère le meilleur prix et la
-moyenne constatés sur ta recherche). Réponds simplement ; « passer » garde la valeur proposée,
+first —, escales max, puis un budget PAR type de billet choisi — chaque
+question budget affiche le prix constaté sur ta recherche : via l'API pour
+l'éco, via Google Flights pour les cabines avant). Réponds simplement ; « passer » garde la valeur proposée,
 `/annuler` garde tout par défaut. À la fin, il lance une première
 vérification et t'envoie le top 3 des prix. Tu peux relancer l'assistant
 n'importe quand avec `/config`.
@@ -95,8 +96,9 @@ au lieu d'instantanément.
   affaires, first, toutes) ; l'éco est vérifiée toutes les 30 min, les
   cabines avant 1x/jour + `/premium`
 - `/escales 1` — escales maxi par trajet (`/escales non` = peu importe)
-- `/budget 700` — budget repère dans la devise principale : les prix
-  au-dessus restent affichés, marqués ⚠️ (`/budget non` = aucun)
+- `/budget 700` — budget repère éco ; `/budget affaires 2500` — par type de
+  billet. Les prix au-dessus restent affichés, marqués ⚠️ (`/budget non` =
+  retire)
 - `/devises EUR USD` — devises suivies ; la 1ère est la principale
 - `/seuil 40` — alerte si un prix tombe 40 % sous la moyenne relevée
 - `/pause` / `/reprendre` — suspend ou relance les vérifications automatiques

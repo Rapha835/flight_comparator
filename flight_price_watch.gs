@@ -1,5 +1,5 @@
 /**
- * FLIGHT PRICE WATCH v2.4 — multi-destinations, multi-devises, fenêtres de
+ * FLIGHT PRICE WATCH v2.5 — multi-destinations, multi-devises, fenêtres de
  * dates façon FlightList, onboarding guidé par questions dans Telegram.
  *
  * Surveille les prix de vols vers PLUSIEURS destinations en parallèle, dans
@@ -51,7 +51,7 @@
  * peut changer sa page), le suivi éco continue normalement.
  */
 
-const SCRIPT_VERSION = "2.4";
+const SCRIPT_VERSION = "2.5";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -305,11 +305,14 @@ function handleCommand_(text) {
     replyTelegram_(t === null ? "🔁 OK : nombre d'escales libre." : "🔁 OK : " + t + " escale(s) maxi par trajet.");
 
   } else if (cmd === "/budget") {
-    const b = parseBudget_(arg);
-    if (b === undefined) { replyTelegram_("Utilise : /budget 700 (en " + cfg.currencies[0] + "), ou /budget non."); return; }
-    cfg.budget = b;
+    // "/budget 700" = éco ; "/budget affaires 2500" = par cabine.
+    const cabins = parseCabins_(arg) || ["economy"];
+    const b = /\b(non|aucun)\b/i.test(arg) ? null : parseBudget_(arg);
+    if (b === undefined) { replyTelegram_("Utilise : /budget 700 (éco), /budget affaires 2500, ou /budget non."); return; }
+    cabins.forEach(function (c) { cfg.budgets[c] = b; });
     saveConfig_(cfg);
-    replyTelegram_(b === null ? "💰 OK : pas de budget maxi." : "💰 OK : budget maxi " + b + " " + cfg.currencies[0] + ".");
+    replyTelegram_(b === null ? "💰 OK : pas de budget " + cabins.map(cabinLabel_).join("/") + "."
+      : "💰 OK : budget " + cabins.map(cabinLabel_).join("/") + " ≤ " + b + " " + cfg.currencies[0] + ".");
 
   } else if (cmd === "/ajouter") {
     if (!arg) { replyTelegram_("Utilise : /ajouter FR (pays) ou /ajouter CDG (aéroport de départ)."); return; }
@@ -392,11 +395,11 @@ function cmdDemarrer_(dest) {
 const WIZARD_STEPS_ = ["destinations", "origins", "depart", "retour", "duree", "cabines", "escales", "budget"];
 
 function startWizard_() {
-  setJson_("WIZARD", { step: 0 });
-  replyTelegram_(wizardQuestion_(0, getConfig_()));
+  setJson_("WIZARD", { step: 0, cabinIdx: 0 });
+  replyTelegram_(wizardQuestion_(0, getConfig_(), 0));
 }
 
-function wizardQuestion_(step, cfg) {
+function wizardQuestion_(step, cfg, cabinIdx) {
   const n = (step + 1) + "/" + WIZARD_STEPS_.length + " — ";
   switch (WIZARD_STEPS_[step]) {
     case "destinations":
@@ -414,17 +417,42 @@ function wizardQuestion_(step, cfg) {
         "ℹ️ L'éco est vérifiée toutes les 30 min ; les cabines avant 1x/jour + /premium.";
     case "escales":
       return "🔁 " + n + "Escales maxi par trajet ?\nEx : 0 (direct), 1, 2, ou « non » (peu importe)\n(actuel : " + (cfg.maxTransfers === null ? "peu importe" : cfg.maxTransfers) + ")";
-    case "budget":
-      return "💰 " + n + "Budget maxi en " + cfg.currencies[0] + " ?\nEx : 700, ou « non »\n(actuel : " + (cfg.budget === null ? "aucun" : cfg.budget) + ")" + priceHint_(cfg);
+    case "budget": {
+      // Une question par type de billet choisi, chacune avec son repère.
+      const cabin = cfg.cabins[cabinIdx || 0];
+      const current = budgetFor_(cfg, cabin);
+      return "💰 " + n + "Budget maxi " + cabinLabel_(cabin).toUpperCase() + ", en " + cfg.currencies[0] + " ?\nEx : 700, ou « non »\n(actuel : " + (current === null ? "aucun" : current) + ")" + priceHint_(cfg, cabin);
+    }
   }
 }
 
 /** Repère de prix affiché avec la question budget : historique récent si
  * disponible, sinon sondage express de quelques aéroports (~2 s). */
-function priceHint_(cfg) {
+function priceHint_(cfg, cabin) {
   try {
     const cur = cfg.currencies[0];
     const dest = cfg.destinations[0];
+
+    // Cabines avant : dernier relevé premium si dispo, sinon sondage
+    // Google Flights sur 3 villes (~10 s, best effort).
+    if (cabin && cabin !== "economy") {
+      const prem = getJson_("LAST_PREMIUM", null);
+      if (prem && prem.results && prem.results[cabin + "|" + dest]) {
+        const known = prem.results[cabin + "|" + dest];
+        return "\n📊 Repère " + cabinLabel_(cabin) + " " + dest + " : " + known.price + " " + prem.currency + " (" + known.origin + ")";
+      }
+      const dates = premiumDates_(cfg);
+      const premPrices = [];
+      expandOrigins_(cfg.origins).slice(0, 3).forEach(function (origin) {
+        try {
+          const offers = fetchGoogleFlightsOffers_(origin, dest, cabin, cur, dates);
+          if (offers.length > 0) premPrices.push(offers[0].price);
+        } catch (e) { /* scraping non garanti : le repère est facultatif */ }
+      });
+      if (premPrices.length === 0) return "\n(pas de repère dispo pour cette cabine — essaie /premium après la config)";
+      return "\n📊 Repère " + cabinLabel_(cabin) + " " + dest + " : meilleur constaté " + Math.min.apply(null, premPrices) + " " + cur;
+    }
+
     let prices = getJson_("RECENT", {})[dest + "|" + cur];
 
     if (!prices || prices.length < 3) {
@@ -500,21 +528,29 @@ function wizardAnswer_(text) {
       }
       case "budget": {
         const b = parseBudget_(t);
-        if (b !== undefined) { cfg.budget = b; parsed = true; }
+        if (b !== undefined) { cfg.budgets[cfg.cabins[wiz.cabinIdx || 0]] = b; parsed = true; }
         break;
       }
     }
     if (!parsed) {
-      replyTelegram_("🤔 Format non reconnu, réessaie (ou « passer »).\n\n" + wizardQuestion_(wiz.step, cfg));
+      replyTelegram_("🤔 Format non reconnu, réessaie (ou « passer »).\n\n" + wizardQuestion_(wiz.step, cfg, wiz.cabinIdx || 0));
       return;
     }
     saveConfig_(cfg);
   }
 
+  // L'étape budget se répète pour chaque type de billet choisi.
+  if (stepName === "budget" && (wiz.cabinIdx || 0) + 1 < cfg.cabins.length) {
+    const nextIdx = (wiz.cabinIdx || 0) + 1;
+    setJson_("WIZARD", { step: wiz.step, cabinIdx: nextIdx });
+    replyTelegram_("✅ Noté !\n\n" + wizardQuestion_(wiz.step, cfg, nextIdx));
+    return;
+  }
+
   const next = wiz.step + 1;
   if (next < WIZARD_STEPS_.length) {
-    setJson_("WIZARD", { step: next });
-    replyTelegram_("✅ Noté !\n\n" + wizardQuestion_(next, cfg));
+    setJson_("WIZARD", { step: next, cabinIdx: 0 });
+    replyTelegram_("✅ Noté !\n\n" + wizardQuestion_(next, cfg, 0));
   } else {
     props_().deleteProperty("WIZARD");
     replyTelegram_("🎉 Configuration terminée !\n\n" + listText_(cfg) + "\n\n🔍 Première vérification… (" + etaText_(cfg, cfg.destinations.length) + ")");
@@ -608,7 +644,7 @@ function listText_(cfg) {
     "✈️ Billets : " + cfg.cabins.map(cabinLabel_).join(", ") + "\n" +
     "🌙 Séjour " + cfg.stayMin + "–" + cfg.stayMax + " nuits · 🔁 " +
     (cfg.maxTransfers === null ? "escales libres" : cfg.maxTransfers + " esc. max") +
-    (cfg.budget !== null ? " · 💰 max " + cfg.budget + " " + cfg.currencies[0] : "") + "\n" +
+    budgetsLabel_(cfg) + "\n" +
     "💱 " + cfg.currencies.join(", ") + "\n" +
     "🚨 Alerte : record battu, ou prix " + cfg.alertPct + "% sous la moyenne\n" +
     (cfg.paused ? "⏸️ En pause" : "▶️ Actif (" + cadenceLabel_(cfg) + ")") + " — v" + SCRIPT_VERSION;
@@ -664,7 +700,8 @@ function helpText_() {
     "/duree 14 21 — séjour min/max (nuits)\n\n" +
     "⚙️ Filtres & réglages\n" +
     "/cabines eco affaires — type de billet\n" +
-    "/escales 1 · /budget 700 · /devises EUR USD\n" +
+    "/escales 1 · /budget 700 (éco) · /budget affaires 2500\n" +
+    "/devises EUR USD\n" +
     "/seuil 40 — alerte si prix 40% sous la moyenne\n" +
     "/pause · /reprendre\n\n" +
     "🔍 Consulter\n" +
@@ -788,7 +825,6 @@ function runCheck_(cfg, destinations, verbose) {
       fmtWindow_(cfg.departWindow) + " → " + fmtWindow_(cfg.returnWindow) +
       ", " + cfg.stayMin + "–" + cfg.stayMax + " nuits" +
       (cfg.maxTransfers !== null ? ", " + cfg.maxTransfers + " esc. max" : "") +
-      (cfg.budget !== null ? ", max " + cfg.budget + " " + cfg.currencies[0] : "") +
       "). Élargis un critère (/config) ou réessaie plus tard — le cache API se remplit au fil des recherches réelles.");
     return;
   }
@@ -842,12 +878,13 @@ function runCheck_(cfg, destinations, verbose) {
       // Résumé compact : top 3 dans la devise principale, meilleur prix seul
       // dans les autres devises.
       if (cur === cfg.currencies[0]) {
-        const overBudget = cfg.budget !== null && best.price > cfg.budget;
+        const ecoBudget = budgetFor_(cfg, "economy");
+        const overBudget = ecoBudget !== null && best.price > ecoBudget;
         summaryLines.push("🎯 " + dest + " (" + cur + ")" +
-          (overBudget ? " — ⚠️ au-dessus de ton budget (" + cfg.budget + ")" : ""));
+          (overBudget ? " — ⚠️ au-dessus de ton budget (" + ecoBudget + ")" : ""));
         list.slice(0, 3).forEach(function (o, i) {
           summaryLines.push((i + 1) + ". " + o.origin + " " + o.price +
-            (cfg.budget !== null && o.price > cfg.budget ? " ⚠️" : "") +
+            (ecoBudget !== null && o.price > ecoBudget ? " ⚠️" : "") +
             " · " + fmtDate_(o.departure_at) + "→" + fmtDate_(o.return_at) +
             " · " + o.transfers + " esc. · " + o.airline);
         });
@@ -890,8 +927,8 @@ function sendAlert_(best, dest, cur, prevMin, med, reasons, cfg) {
     "💰 " + best.price + " " + cur + (prevMin !== null ? " (record précédent : " + prevMin + ")" : "") + pctLine + "\n" +
     "🛫 " + best.origin + " → " + dest + " · " + fmtDate_(best.departure_at) + "→" + fmtDate_(best.return_at) +
     " · " + best.transfers + " esc. · " + best.airline + "\n\n" +
-    (cfg.budget !== null && cur === cfg.currencies[0] && best.price > cfg.budget
-      ? "💸 Au-dessus de ton budget (" + cfg.budget + " " + cur + ")\n" : "") +
+    (budgetFor_(cfg, "economy") !== null && cur === cfg.currencies[0] && best.price > budgetFor_(cfg, "economy")
+      ? "💸 Au-dessus de ton budget (" + budgetFor_(cfg, "economy") + " " + cur + ")\n" : "") +
     "🔗 " + buildLink_(best) + "\n" +
     "⚠️ Prix issu du cache API (~48h) — vérifie avant d'acheter.";
 
@@ -1155,7 +1192,9 @@ function runPremiumCheck_(verbose) {
         forKey.sort(function (a, b) { return a.price - b.price; });
         const best = forKey[0];
         if (!destShown) { summaryLines.push("\n🎯 " + dest); destShown = true; }
-        summaryLines.push(cabinLabel_(cabin) + " : " + best.price + " (" + best.origin + ", " + best.stops + " esc.)");
+        const cabBudget = budgetFor_(cfg, cabin);
+        summaryLines.push(cabinLabel_(cabin) + " : " + best.price + " (" + best.origin + ", " + best.stops + " esc.)" +
+          (cabBudget !== null && best.price > cabBudget ? " ⚠️ > " + cabBudget : ""));
         lastPremium.results[cabin + "|" + dest] = best;
 
         const key = cabin + "|" + dest + "|" + cur;
@@ -1186,6 +1225,18 @@ function premiumDates_(cfg) {
   const d = new Date(depart + "T12:00:00Z");
   d.setUTCDate(d.getUTCDate() + days);
   return { depart: depart, ret: d.toISOString().substring(0, 10) };
+}
+
+function budgetsLabel_(cfg) {
+  const parts = cfg.cabins
+    .filter(function (c) { return budgetFor_(cfg, c) !== null; })
+    .map(function (c) { return cabinLabel_(c) + " " + budgetFor_(cfg, c); });
+  return parts.length > 0 ? " · 💰 max " + parts.join(", ") + " " + cfg.currencies[0] : "";
+}
+
+function budgetFor_(cfg, cabin) {
+  const b = cfg.budgets && cfg.budgets[cabin];
+  return (b === undefined || b === null) ? null : b;
 }
 
 function cabinLabel_(cabin) {
@@ -1388,7 +1439,7 @@ function defaultConfig_() {
     stayMax: CONFIG_STATIC.DEFAULT_STAY[1],
     cabins: ["economy"],
     maxTransfers: null,
-    budget: null,
+    budgets: {}, // budget max par cabine, ex. { economy: 700, business: 2500 }
     alertPct: CONFIG_STATIC.DEFAULT_ALERT_PCT,
     paused: false
   };
@@ -1419,6 +1470,12 @@ function getConfig_() {
     if (cfg[k] === undefined) { cfg[k] = defaults[k]; dirty = true; }
   });
   if (cfg.alertBelow !== undefined) { delete cfg.alertBelow; dirty = true; }
+  // v2.4 → v2.5 : budget unique → budgets par cabine.
+  if (cfg.budget !== undefined) {
+    if (cfg.budget !== null) cfg.budgets.economy = cfg.budget;
+    delete cfg.budget;
+    dirty = true;
+  }
   if (dirty) saveConfig_(cfg);
   return cfg;
 }
