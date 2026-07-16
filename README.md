@@ -39,7 +39,9 @@ Guide complet pas-à-pas dans [`GUIDE_installation.md`](GUIDE_installation.md) �
 2. Crée un bot Telegram via [@BotFather](https://t.me/BotFather) et récupère ton token + ton `chat_id`.
 3. Copie `flight_price_watch.gs` dans un nouveau projet [Google Apps Script](https://script.google.com), remplis le bloc `CONFIG_STATIC` avec tes identifiants, exécute `setup()`.
 
-C'est tout — tu reçois un message de confirmation sur Telegram. Pas de déploiement, pas de webhook : le script relève tes commandes Telegram toutes les minutes (polling), et toute modification du code prend effet dès la sauvegarde. Aucune carte bancaire, aucun serveur à gérer, 100 % gratuit dans les limites d'usage personnel.
+C'est tout — le bot t'écrit sur Telegram et lance **l'onboarding : 7 questions rapides** (destinations, zone de départ, fenêtre de dates aller, fenêtre retour, durée du séjour, escales max, budget max). Réponds simplement ; « passer » garde la valeur proposée, `/annuler` garde tout par défaut. À la fin, première vérification et top 3 des prix. L'assistant se relance à tout moment avec `/config`.
+
+Pas de déploiement, pas de webhook : le script relève tes commandes Telegram toutes les minutes (polling), et toute modification du code prend effet dès la sauvegarde. Aucune carte bancaire, aucun serveur à gérer, 100 % gratuit dans les limites d'usage personnel.
 
 ## Adapter à d'autres destinations / villes de départ / dates
 
@@ -49,7 +51,7 @@ Tout se règle depuis Telegram : `/config` relance l'assistant complet (7 questi
 
 | Commande | Effet |
 |---|---|
-| `/config` | assistant complet — 7 questions, façon FlightList |
+| `/config` | relance l'onboarding — 7 questions, façon FlightList (« passer » = garder, `/annuler` = abandonner) |
 | `/demarrer ICN` (ou juste `ICN`) | ajoute/active une destination + vérification immédiate |
 | `/retirer ICN` | retire une destination (ou une ville de départ) |
 | `/ajouter FR` | ajoute un pays (étendu auto) ou un aéroport de départ précis |
@@ -92,7 +94,7 @@ Rappel : le bot répond en **1 minute maxi** (il relève les messages toutes les
    - `Message ignoré — chat_id reçu : X ≠ attendu : Y` → ton `TELEGRAM_CHAT_ID` est faux : mets la valeur `X` affichée, sauvegarde, c'est réglé.
    - `Erreur getUpdates : ... 409 ...` → un ancien webhook bloque encore la relève des messages : ré-exécute `setup()` (il le supprime automatiquement).
    - `Échec d'envoi Telegram : ...` → la réponse part mais Telegram la refuse ; le message d'erreur JSON te dit pourquoi (token bot invalide, etc.).
-3. **Les tokens sont-ils bons ?** Exécute `setup()` : si tout est correct, tu reçois immédiatement « 🤖 Flight Price Watch installé et actif ! » sur Telegram. Sinon, regarde le journal de `setup`.
+3. **Les tokens sont-ils bons ?** Exécute `setup()` : si tout est correct, tu reçois immédiatement le message d'installation et la première question de l'assistant sur Telegram. Sinon, regarde le journal de `setup`.
 
 ### Pourquoi du polling et pas un webhook Telegram ?
 
@@ -104,11 +106,11 @@ Vérifie que tu as bien **sauvegardé** le fichier (Cmd/Ctrl+S) — les triggers
 
 ### Le panneau Exécutions montre des erreurs `Script function not found: xxx`
 
-Un déclencheur (trigger) d'une ancienne version du script appelle une fonction qui n'existe plus. Exécute `setup()` : il supprime **tous** les anciens triggers avant de recréer les bons. Tu peux vérifier dans le panneau ⏰ **Déclencheurs** qu'il ne reste que `checkPrices` (30 min) et éventuellement `checkPremiumCabins` (1x/jour).
+Un déclencheur (trigger) d'une ancienne version du script appelle une fonction qui n'existe plus. Exécute `setup()` : il supprime **tous** les anciens triggers avant de recréer les bons. Tu peux vérifier dans le panneau ⏰ **Déclencheurs** qu'il ne reste que `pollTelegram` (1 min), `checkPrices` (30 min) et éventuellement `checkPremiumCabins` (1x/jour).
 
 ### Je reçois la même alerte en boucle
 
-Symptôme de la v1 (l'alerte « sous le seuil » se re-déclenchait à chaque passage). Corrigé en v2 : une alerte donnée (record, anomalie ou seuil) n'est jamais renvoyée pour le même prix. Si ça t'arrive encore, vérifie avec `/aide` que tu es bien en v2.1+ (voir question précédente).
+Symptôme de la v1 (l'alerte « sous le seuil » se re-déclenchait à chaque passage). Corrigé depuis : une alerte donnée (record battu ou probable erreur de prix) n'est jamais renvoyée pour le même prix. Si ça t'arrive encore, vérifie avec `/aide` que tu es bien en v2.2+ (voir question précédente).
 
 ### `/pause` ne semble pas pris en compte
 
