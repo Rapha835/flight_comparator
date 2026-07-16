@@ -43,32 +43,29 @@ vérifie toujours le prix exact avant de payer.
 1. Va sur https://script.google.com → **Nouveau projet**.
 2. Supprime le code par défaut, colle tout le contenu de
    `flight_price_watch.gs` (fourni à côté de ce guide).
-3. Tout en haut du fichier, remplis le bloc `CONFIG_STATIC` :
+3. Tout en haut du fichier, remplis le bloc `CONFIG_STATIC` — seules ces
+   3 lignes sont indispensables, tout le reste se règle ensuite dans Telegram :
    - `TRAVELPAYOUTS_TOKEN` → le token de l'étape 1
    - `TELEGRAM_BOT_TOKEN` → le token de l'étape 2
    - `TELEGRAM_CHAT_ID` → le chat_id de l'étape 2
-   - `DEFAULT_DESTINATIONS` → destinations de départ (ex. `["SEL"]` = Séoul,
-     ou `["ICN"]` pour ne cibler qu'Incheon) — ensuite tu en ajoutes/retires
-     via Telegram (`/demarrer ICN`, `/retirer ICN`)
-   - `DEFAULT_ORIGINS` → villes de départ, déjà pré-remplies avec des codes
-     pays (`"FR"`, `"BE"`, `"NL"`, `"GB"`, `"DE"`, `"ES"`, `"IT"`, `"PT"`,
-     `"CH"`) — chaque pays s'étend automatiquement vers ses aéroports
-     principaux (voir `COUNTRY_AIRPORTS` juste en dessous dans le code)
-   - `DEFAULT_CURRENCIES` → devises suivies, ex. `["EUR", "USD"]` — suivre
-     plusieurs devises aide à repérer les erreurs de prix visibles dans une
-     seule devise ; la 1ère est celle du seuil d'alerte
-   - `DEFAULT_ALERT_BELOW` → seuil de prix de départ (dans la 1ère devise)
-   - Ces valeurs `DEFAULT_*` ne servent qu'au tout premier lancement —
-     ensuite tout se pilote via Telegram.
+
+   (Les valeurs `DEFAULT_*` en dessous — destinations, zone de départ,
+   fenêtres de dates, devises… — ne sont que des points de départ proposés
+   par l'assistant, modifie-les seulement si tu veux d'autres défauts.)
 4. Renomme le projet (en haut à gauche) en quelque chose comme
-   "Suivi vols Corée".
+   "Suivi vols".
 5. Dans la barre d'outils, sélectionne la fonction **setup** puis clique
    **Exécuter** (▶). Google va demander d'autoriser le script (accès à
    Google Sheets, Drive, et aux requêtes externes) — accepte.
 
-C'est tout. Si les tokens sont bons, tu reçois immédiatement un message
-Telegram « 🤖 Flight Price Watch installé et actif ! ». Envoie `/aide` pour
-vérifier (réponse sous 1 minute).
+C'est tout. Si les tokens sont bons, le bot t'écrit immédiatement sur
+Telegram et lance **l'assistant de configuration : 7 questions rapides**
+(destinations, zone de départ, fenêtre de dates aller, fenêtre retour,
+durée du séjour en nuits, escales max, budget max — les mêmes critères que
+FlightList). Réponds simplement ; « passer » garde la valeur proposée,
+`/annuler` garde tout par défaut. À la fin, il lance une première
+vérification et t'envoie le top 3 des prix. Tu peux relancer l'assistant
+n'importe quand avec `/config`.
 
 **Pas de déploiement Web App, pas de webhook** : le script relève lui-même
 tes messages Telegram toutes les minutes (polling). C'est un choix délibéré —
@@ -81,40 +78,43 @@ au lieu d'instantanément.
 
 ## Commandes Telegram
 
+- `/config` — relance l'assistant complet (7 questions)
 - `/demarrer ICN` — ajoute ICN aux destinations suivies (et réactive la
-  surveillance si elle était en pause) + vérification immédiate de cette
-  destination. Envoyer juste `ICN` (3 lettres, sans `/`) fait pareil.
+  surveillance si elle était en pause) + vérification immédiate. Envoyer
+  juste `ICN` (3 lettres, sans `/`) fait pareil.
 - `/retirer ICN` — retire une destination (ou une ville de départ si le code
   correspond à un départ)
 - `/ajouter FR` — ajoute un pays (étendu automatiquement) ou un aéroport de
   départ précis, ex. `/ajouter CDG`
-- `/devises EUR USD` — change les devises suivies ; la 1ère porte le seuil
-- `/seuil 600` — change le seuil qui déclenche une alerte immédiate
+- `/dates 2026-10-01 2026-10-14` — fenêtre de DÉPART (ou `/dates 2026-10`
+  pour tout le mois)
+- `/retour 2026-10-19 2026-11-03` — fenêtre de RETOUR
+- `/duree 14 21` — durée du séjour min/max (nuits)
+- `/escales 1` — escales maxi par trajet (`/escales non` = peu importe)
+- `/budget 700` — prix maxi, dans la devise principale (`/budget non` = aucun)
+- `/devises EUR USD` — devises suivies ; la 1ère est la principale
+- `/seuil 40` — alerte si un prix tombe 40 % sous la moyenne relevée
 - `/pause` / `/reprendre` — suspend ou relance les vérifications automatiques
-- `/check` — force une vérification immédiate et renvoie un résumé des
-  meilleurs prix par destination/devise
-- `/liste` — affiche destinations, départs, devises, seuil, état
-  (actif/pause) et la version du script
-- `/status` — derniers meilleurs prix trouvés, sans attendre le prochain passage
+- `/check` — vérification immédiate, top 3 par destination + prix dans les
+  autres devises
+- `/premium` — vérifie éco premium / affaires / première à la demande
+- `/liste` — récap complet de la config (et version du script)
+- `/status` — derniers prix éco ET cabines premium
 - `/aide` — rappel de toutes les commandes (+ version du script)
 
 ## Vérifier / consulter
 
-Un Google Sheet nommé **"Historique prix Corée du Sud"** est créé
-automatiquement dans ton Drive (onglet **"Log v2"**). À chaque passage
-(toutes les 30 min), le script enregistre le meilleur prix trouvé pour CHAQUE
-aéroport surveillé, par destination et par devise — tableau comparatif
-complet qui s'accumule tout seul.
+Un Google Sheet est créé automatiquement dans ton Drive (onglet **"Log v2"**,
++ **"Log Premium"** pour les cabines). À chaque passage (toutes les 30 min),
+le script enregistre les meilleurs prix par aéroport de départ, destination
+et devise — tableau comparatif complet qui s'accumule tout seul.
 
 Tu reçois un message Telegram **seulement** quand, pour une destination et
 une devise données :
 - le meilleur prix bat son record historique, ou
-- le prix est anormalement bas par rapport aux ~30 derniers relevés
-  (≤ 60 % de la médiane → probable **erreur de prix**), ou
-- le prix passe sous ton seuil — une seule fois par baisse, jamais deux
-  alertes pour le même prix.
-
-Chaque alerte inclut le classement des 3 villes de départ les moins chères.
+- le prix tombe X % sous la médiane des ~30 derniers relevés (X = ton
+  `/seuil`, 40 % par défaut → probable **erreur de prix**)
+— et jamais deux alertes pour le même prix.
 
 ## Mettre à jour le script
 
@@ -137,20 +137,18 @@ peu fréquent pour rester discret.
   Ça peut casser sans prévenir si Google modifie sa page — c'est pour ça que
   chaque appel est protégé individuellement : si ce module tombe en panne, le
   suivi éco principal continue de tourner normalement, sans aucune coupure.
-- Les prix sont calculés sur des dates fixes (`PREMIUM_SAMPLE_DEPART_DATE` /
-  `PREMIUM_SAMPLE_RETURN_DATE` dans `CONFIG_STATIC`, 5 → 19 octobre 2026 par
-  défaut) plutôt qu'un mois entier flexible — ajuste ces deux dates dans le
-  code si tu vises d'autres dates précises.
+- Google Flights exige des dates précises (pas de fenêtre flexible) : le
+  module échantillonne automatiquement le début de ta fenêtre de départ +
+  un séjour de durée moyenne (entre tes bornes min/max).
 - Les résultats vont dans un second onglet du même Google Sheet : **"Log
-  Premium"**.
+  Premium"**, et apparaissent dans `/status`. `/premium` force une
+  vérification à la demande.
 - Alerte Telegram séparée dès qu'une cabine (éco premium, affaires ou
   première) bat son record précédent, avec un rappel qu'il faut revérifier
   le prix avant de réserver.
-- Pas encore pilotable par commande Telegram — les réglages
-  (`PREMIUM_ENABLED`, `PREMIUM_CABINS`, `PREMIUM_MAX_ORIGINS`, dates) se
-  changent directement dans `CONFIG_STATIC`, pas besoin de relancer `setup`
-  pour qu'ils prennent effet (relus à chaque passage), sauf pour activer ou
-  désactiver le trigger lui-même — dans ce cas relance `setup`.
+- Réglages avancés (`PREMIUM_ENABLED`, `PREMIUM_CABINS`,
+  `PREMIUM_MAX_ORIGINS`) dans `CONFIG_STATIC` — relus à chaque passage, sauf
+  pour activer/désactiver le trigger quotidien lui-même (relance `setup`).
 
 ## Pour arrêter ou ajuster
 
@@ -158,7 +156,7 @@ peu fréquent pour rester discret.
   démonter ; `/demarrer` ou `/reprendre` relance.
 - Pour arrêter complètement (supprimer les triggers) : exécute la fonction
   **stop** dans l'éditeur Apps Script.
-- Destinations, départs, devises et seuil se pilotent par Telegram. Seuls le
-  mois surveillé (`DEPARTURE_MONTH`/`RETURN_MONTH`) et la durée de séjour
-  min/max restent dans `CONFIG_STATIC` — modifie-les directement dans le
-  code et sauvegarde, ils sont relus à chaque vérification.
+- Absolument tous les critères de recherche (destinations, zone de départ,
+  fenêtres de dates, durée, escales, budget, devises, seuil d'alerte) se
+  pilotent par Telegram — `/config` pour l'assistant, ou les commandes une
+  par une. Plus rien à modifier dans le code au quotidien.
