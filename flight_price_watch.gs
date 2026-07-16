@@ -1,5 +1,5 @@
 /**
- * FLIGHT PRICE WATCH v2.5 — multi-destinations, multi-devises, fenêtres de
+ * FLIGHT PRICE WATCH v2.6 — multi-destinations, multi-devises, fenêtres de
  * dates façon FlightList, onboarding guidé par questions dans Telegram.
  *
  * Surveille les prix de vols vers PLUSIEURS destinations en parallèle, dans
@@ -51,7 +51,7 @@
  * peut changer sa page), le suivi éco continue normalement.
  */
 
-const SCRIPT_VERSION = "2.5";
+const SCRIPT_VERSION = "2.6";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -431,53 +431,89 @@ function wizardQuestion_(step, cfg, cabinIdx) {
 function priceHint_(cfg, cabin) {
   try {
     const cur = cfg.currencies[0];
-    const dest = cfg.destinations[0];
 
-    // Cabines avant : dernier relevé premium si dispo, sinon sondage
-    // Google Flights sur 3 villes (~10 s, best effort).
+    // Cabines avant : dernier relevé premium si dispo (toutes destinations),
+    // sinon sondage Google Flights sur 3 villes (~10 s, best effort).
     if (cabin && cabin !== "economy") {
       const prem = getJson_("LAST_PREMIUM", null);
-      if (prem && prem.results && prem.results[cabin + "|" + dest]) {
-        const known = prem.results[cabin + "|" + dest];
-        return "\n📊 Repère " + cabinLabel_(cabin) + " " + dest + " : " + known.price + " " + prem.currency + " (" + known.origin + ")";
+      for (let i = 0; i < cfg.destinations.length; i++) {
+        const d = cfg.destinations[i];
+        if (prem && prem.results && prem.results[cabin + "|" + d]) {
+          const known = prem.results[cabin + "|" + d];
+          return "\n📊 Repère " + cabinLabel_(cabin) + " " + d + " : " + known.price + " " + prem.currency + " (" + known.origin + ")";
+        }
       }
       const dates = premiumDates_(cfg);
       const premPrices = [];
       expandOrigins_(cfg.origins).slice(0, 3).forEach(function (origin) {
         try {
-          const offers = fetchGoogleFlightsOffers_(origin, dest, cabin, cur, dates);
+          const offers = fetchGoogleFlightsOffers_(origin, cfg.destinations[0], cabin, cur, dates);
           if (offers.length > 0) premPrices.push(offers[0].price);
         } catch (e) { /* scraping non garanti : le repère est facultatif */ }
       });
       if (premPrices.length === 0) return "\n(pas de repère dispo pour cette cabine — essaie /premium après la config)";
-      return "\n📊 Repère " + cabinLabel_(cabin) + " " + dest + " : meilleur constaté " + Math.min.apply(null, premPrices) + " " + cur;
+      return "\n📊 Repère " + cabinLabel_(cabin) + " " + cfg.destinations[0] + " : meilleur constaté " + Math.min.apply(null, premPrices) + " " + cur;
     }
 
-    let prices = getJson_("RECENT", {})[dest + "|" + cur];
+    // Éco — sources par ordre de fraîcheur/fiabilité :
+    // 1) historique accumulé par le tracker (première destination qui en a)
+    const recent = getJson_("RECENT", {});
+    for (let i = 0; i < cfg.destinations.length; i++) {
+      const d = cfg.destinations[i];
+      const hist = recent[d + "|" + cur];
+      if (hist && hist.length >= 3) {
+        return "\n📊 Repère " + d + " : meilleur récent " + Math.min.apply(null, hist) + " " + cur +
+          ", moyenne ~" + Math.round(median_(hist)) + " " + cur;
+      }
+    }
 
-    if (!prices || prices.length < 3) {
-      const origins = expandOrigins_(cfg.origins).slice(0, 6);
-      const dm = monthsInWindow_(cfg.departWindow)[0];
-      const months = monthsInWindow_(cfg.returnWindow);
-      const rm = months[months.length - 1] < dm ? dm : months[months.length - 1];
-      const resps = UrlFetchApp.fetchAll(origins.map(function (o) {
-        return { url: buildApiUrl_(o, dest, cur, dm, rm), muteHttpExceptions: true };
-      }));
-      prices = [];
-      resps.forEach(function (r) {
-        try {
-          const offers = parseOffers_(r, cfg, cur);
-          if (offers.length > 0) prices.push(offers[0].price);
-        } catch (e) { /* aéroport sans donnée : ignoré */ }
+    // 2) dernière vérification complète
+    const lastResult = getJson_("LAST_RESULT", null);
+    if (lastResult && lastResult.results) {
+      for (let i = 0; i < cfg.destinations.length; i++) {
+        const d = cfg.destinations[i];
+        const r = lastResult.results[d + "|" + cur];
+        if (r && r.best) {
+          return "\n📊 Repère " + d + " : meilleur actuel " + r.best.price + " " + cur + " (" + r.best.origin + ")";
+        }
+      }
+    }
+
+    // 3) sondage express : 6 origines × les 2 premières destinations
+    const origins = expandOrigins_(cfg.origins).slice(0, 6);
+    const dm = monthsInWindow_(cfg.departWindow)[0];
+    const months = monthsInWindow_(cfg.returnWindow);
+    const rm = months[months.length - 1] < dm ? dm : months[months.length - 1];
+    const probes = [];
+    cfg.destinations.slice(0, 2).forEach(function (d) {
+      origins.forEach(function (o) {
+        probes.push({ dest: d, url: buildApiUrl_(o, d, cur, dm, rm) });
       });
-    }
+    });
+    const resps = UrlFetchApp.fetchAll(probes.map(function (pr) { return { url: pr.url, muteHttpExceptions: true }; }));
+    const byDest = {};
+    resps.forEach(function (r, i) {
+      try {
+        const offers = parseOffers_(r, cfg, cur);
+        if (offers.length > 0) {
+          if (!byDest[probes[i].dest]) byDest[probes[i].dest] = [];
+          byDest[probes[i].dest].push(offers[0].price);
+        }
+      } catch (e) { /* route sans donnée : ignorée */ }
+    });
+    const lines = [];
+    Object.keys(byDest).forEach(function (d) {
+      const arr = byDest[d];
+      lines.push("📊 Repère " + d + " : meilleur constaté " + Math.min.apply(null, arr) + " " + cur +
+        ", moyenne ~" + Math.round(median_(arr)) + " " + cur);
+    });
+    if (lines.length > 0) return "\n" + lines.join("\n");
 
-    if (!prices || prices.length === 0) return "";
-    const min = Math.min.apply(null, prices);
-    return "\n📊 Repère " + dest + " : meilleur constaté " + min + " " + cur +
-      ", moyenne ~" + Math.round(median_(prices)) + " " + cur;
+    // 4) vraiment aucune donnée : on le DIT, jamais de silence.
+    return "\n(pas encore de repère : le cache API n'a pas de prix pour ces routes — il se remplira dès les premières vérifications, regarde /status ensuite)";
   } catch (e) {
-    return ""; // le repère est un bonus : jamais bloquant
+    Logger.log("priceHint_ : " + e);
+    return "\n(repère indisponible pour l'instant)";
   }
 }
 
