@@ -59,10 +59,11 @@ vérifie toujours le prix exact avant de payer.
    Google Sheets, Drive, et aux requêtes externes) — accepte.
 
 C'est tout. Si les tokens sont bons, le bot t'écrit immédiatement sur
-Telegram et lance **l'assistant de configuration : 7 questions rapides**
+Telegram et lance **l'assistant de configuration : 8 questions rapides**
 (destinations, zone de départ, fenêtre de dates aller, fenêtre retour,
-durée du séjour en nuits, escales max, budget max — les mêmes critères que
-FlightList). Réponds simplement ; « passer » garde la valeur proposée,
+durée du séjour en nuits, type de billet — éco / éco premium / affaires /
+first —, escales max, budget max — avec en repère le meilleur prix et la
+moyenne constatés sur ta recherche). Réponds simplement ; « passer » garde la valeur proposée,
 `/annuler` garde tout par défaut. À la fin, il lance une première
 vérification et t'envoie le top 3 des prix. Tu peux relancer l'assistant
 n'importe quand avec `/config`.
@@ -78,7 +79,7 @@ au lieu d'instantanément.
 
 ## Commandes Telegram
 
-- `/config` — relance l'assistant complet (7 questions)
+- `/config` — relance l'assistant complet (8 questions)
 - `/demarrer ICN` — ajoute ICN aux destinations suivies (et réactive la
   surveillance si elle était en pause) + vérification immédiate. Envoyer
   juste `ICN` (3 lettres, sans `/`) fait pareil.
@@ -90,6 +91,9 @@ au lieu d'instantanément.
   pour tout le mois)
 - `/retour 2026-10-19 2026-11-03` — fenêtre de RETOUR
 - `/duree 14 21` — durée du séjour min/max (nuits)
+- `/cabines eco affaires` — type de billet suivi (éco, éco premium,
+  affaires, first, toutes) ; l'éco est vérifiée toutes les 30 min, les
+  cabines avant 1x/jour + `/premium`
 - `/escales 1` — escales maxi par trajet (`/escales non` = peu importe)
 - `/budget 700` — prix maxi, dans la devise principale (`/budget non` = aucun)
 - `/devises EUR USD` — devises suivies ; la 1ère est la principale
@@ -146,9 +150,10 @@ peu fréquent pour rester discret.
 - Alerte Telegram séparée dès qu'une cabine (éco premium, affaires ou
   première) bat son record précédent, avec un rappel qu'il faut revérifier
   le prix avant de réserver.
-- Réglages avancés (`PREMIUM_ENABLED`, `PREMIUM_CABINS`,
-  `PREMIUM_MAX_ORIGINS`) dans `CONFIG_STATIC` — relus à chaque passage, sauf
-  pour activer/désactiver le trigger quotidien lui-même (relance `setup`).
+- Les cabines suivies se choisissent dans l'onboarding ou via `/cabines`.
+  Réglages avancés (`PREMIUM_ENABLED`, `PREMIUM_MAX_ORIGINS`) dans
+  `CONFIG_STATIC` — relus à chaque passage, sauf pour activer/désactiver le
+  trigger quotidien lui-même (relance `setup`).
 
 ## Pour arrêter ou ajuster
 

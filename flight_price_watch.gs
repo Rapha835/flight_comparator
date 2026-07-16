@@ -1,5 +1,5 @@
 /**
- * FLIGHT PRICE WATCH v2.2 — multi-destinations, multi-devises, fenêtres de
+ * FLIGHT PRICE WATCH v2.3 — multi-destinations, multi-devises, fenêtres de
  * dates façon FlightList, onboarding guidé par questions dans Telegram.
  *
  * Surveille les prix de vols vers PLUSIEURS destinations en parallèle, dans
@@ -7,10 +7,15 @@
  * seule devise), depuis une "zone de départ" multi-aéroports (un code pays
  * comme "FR" s'étend automatiquement vers ses principaux aéroports).
  *
- * Critères pilotables par Telegram (assistant /config, 7 questions) :
+ * Critères pilotables par Telegram (assistant /config, 8 questions) :
  *   destinations · zone de départ · fenêtre de dates ALLER (ex. 1–14 oct) ·
  *   fenêtre de dates RETOUR (ex. 19 oct–3 nov) · durée du séjour (nuits) ·
- *   escales max · budget max
+ *   type de billet (éco / éco premium / affaires / first) · escales max ·
+ *   budget max (avec repère : meilleur prix et moyenne constatés)
+ *
+ * L'éco est suivie toutes les 30 min via l'API ; les cabines avant (éco
+ * premium, affaires, first) 1x/jour + /premium à la demande, via le module
+ * Google Flights (limite du scraping gratuit).
  *
  * Alertes Telegram uniquement quand :
  *   - un prix bat son record historique (par destination + devise), ou
@@ -46,7 +51,7 @@
  * peut changer sa page), le suivi éco continue normalement.
  */
 
-const SCRIPT_VERSION = "2.2";
+const SCRIPT_VERSION = "2.3";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -76,9 +81,9 @@ const CONFIG_STATIC = {
   // Requêtes API envoyées en parallèle par lots (rapide sans matraquer l'API).
   FETCH_BATCH_SIZE: 15,
 
-  // --- Module cabines premium ---
-  PREMIUM_ENABLED: true,
-  PREMIUM_CABINS: ["premium-economy", "business", "first"],
+  // --- Module cabines avant (éco premium / affaires / first) ---
+  // Les cabines suivies se choisissent dans l'onboarding ou via /cabines.
+  PREMIUM_ENABLED: true, // false = ne crée jamais le trigger quotidien
   PREMIUM_MAX_ORIGINS: 5 // limite le nombre de villes interrogées (volume = risque de blocage)
 };
 
@@ -154,7 +159,7 @@ function setup() {
   }
 
   replyTelegram_("🤖 Flight Price Watch v" + SCRIPT_VERSION + " installé !\n" +
-    "Configurons ta recherche en 7 questions rapides. Réponds simplement ; " +
+    "Configurons ta recherche en 8 questions rapides. Réponds simplement ; " +
     "envoie « passer » pour garder la valeur proposée, /annuler pour tout garder par défaut. " +
     "(Je réponds en 1 min maxi.)");
   startWizard_();
@@ -276,6 +281,14 @@ function handleCommand_(text) {
     saveConfig_(cfg);
     replyTelegram_("🌙 OK : séjour entre " + stay[0] + " et " + stay[1] + " nuits.");
 
+  } else if (cmd === "/cabines") {
+    const cabins = arg ? parseCabins_(arg) : null;
+    if (!cabins) { replyTelegram_("Utilise : /cabines eco affaires (choix : eco, eco premium, affaires, first, toutes)."); return; }
+    cfg.cabins = cabins;
+    saveConfig_(cfg);
+    replyTelegram_("✈️ Billets suivis : " + cabins.map(cabinLabel_).join(", ") + "." +
+      (cabins.indexOf("economy") === -1 ? "\n⚠️ Éco non suivie : les vérifications 30 min sont suspendues, cabines avant 1x/jour + /premium." : ""));
+
   } else if (cmd === "/escales") {
     const t = parseTransfers_(arg);
     if (t === undefined) { replyTelegram_("Utilise : /escales 0 (direct), 1, 2, ou /escales non (peu importe)."); return; }
@@ -365,10 +378,10 @@ function cmdDemarrer_(dest) {
 }
 
 /** ============ ASSISTANT DE CONFIGURATION (/config) ============
- * 7 questions posées une par une dans Telegram, calquées sur les critères
+ * 8 questions posées une par une dans Telegram, calquées sur les critères
  * FlightList. "passer" garde la valeur actuelle, /annuler abandonne.
  * L'état (numéro d'étape) vit dans la propriété WIZARD. */
-const WIZARD_STEPS_ = ["destinations", "origins", "depart", "retour", "duree", "escales", "budget"];
+const WIZARD_STEPS_ = ["destinations", "origins", "depart", "retour", "duree", "cabines", "escales", "budget"];
 
 function startWizard_() {
   setJson_("WIZARD", { step: 0 });
@@ -388,10 +401,47 @@ function wizardQuestion_(step, cfg) {
       return "📅 " + n + "Fenêtre de RETOUR ?\nEx : 2026-11 ou 2026-10-19 2026-11-03\n(actuel : " + cfg.returnWindow[0] + " → " + cfg.returnWindow[1] + ")";
     case "duree":
       return "🌙 " + n + "Durée du séjour, en nuits ?\nEx : 14 21 (entre 14 et 21 nuits)\n(actuel : " + cfg.stayMin + "–" + cfg.stayMax + ")";
+    case "cabines":
+      return "✈️ " + n + "Type de billet ? Plusieurs possibles.\nEx : eco · eco premium · affaires · first · toutes\n(actuel : " + cfg.cabins.map(cabinLabel_).join(", ") + ")\n" +
+        "ℹ️ L'éco est vérifiée toutes les 30 min ; les cabines avant 1x/jour + /premium.";
     case "escales":
       return "🔁 " + n + "Escales maxi par trajet ?\nEx : 0 (direct), 1, 2, ou « non » (peu importe)\n(actuel : " + (cfg.maxTransfers === null ? "peu importe" : cfg.maxTransfers) + ")";
     case "budget":
-      return "💰 " + n + "Budget maxi en " + cfg.currencies[0] + " ?\nEx : 700, ou « non »\n(actuel : " + (cfg.budget === null ? "aucun" : cfg.budget) + ")";
+      return "💰 " + n + "Budget maxi en " + cfg.currencies[0] + " ?\nEx : 700, ou « non »\n(actuel : " + (cfg.budget === null ? "aucun" : cfg.budget) + ")" + priceHint_(cfg);
+  }
+}
+
+/** Repère de prix affiché avec la question budget : historique récent si
+ * disponible, sinon sondage express de quelques aéroports (~2 s). */
+function priceHint_(cfg) {
+  try {
+    const cur = cfg.currencies[0];
+    const dest = cfg.destinations[0];
+    let prices = getJson_("RECENT", {})[dest + "|" + cur];
+
+    if (!prices || prices.length < 3) {
+      const origins = expandOrigins_(cfg.origins).slice(0, 6);
+      const dm = monthsInWindow_(cfg.departWindow)[0];
+      const months = monthsInWindow_(cfg.returnWindow);
+      const rm = months[months.length - 1] < dm ? dm : months[months.length - 1];
+      const resps = UrlFetchApp.fetchAll(origins.map(function (o) {
+        return { url: buildApiUrl_(o, dest, cur, dm, rm), muteHttpExceptions: true };
+      }));
+      prices = [];
+      resps.forEach(function (r) {
+        try {
+          const offers = parseOffers_(r, cfg, cur);
+          if (offers.length > 0) prices.push(offers[0].price);
+        } catch (e) { /* aéroport sans donnée : ignoré */ }
+      });
+    }
+
+    if (!prices || prices.length === 0) return "";
+    const min = Math.min.apply(null, prices);
+    return "\n📊 Repère " + dest + " : meilleur constaté " + min + " " + cur +
+      ", moyenne ~" + Math.round(median_(prices)) + " " + cur;
+  } catch (e) {
+    return ""; // le repère est un bonus : jamais bloquant
   }
 }
 
@@ -428,6 +478,11 @@ function wizardAnswer_(text) {
       case "duree": {
         const stay = parseStay_(t);
         if (stay) { cfg.stayMin = stay[0]; cfg.stayMax = stay[1]; parsed = true; }
+        break;
+      }
+      case "cabines": {
+        const cabins = parseCabins_(t);
+        if (cabins) { cfg.cabins = cabins; parsed = true; }
         break;
       }
       case "escales": {
@@ -495,6 +550,29 @@ function parseStay_(text) {
   return null;
 }
 
+// "eco affaires" → ["economy","business"] ; "toutes" → les 4 cabines ;
+// null si rien de reconnu. Gère "eco premium" (2 mots) avant "eco".
+function parseCabins_(text) {
+  let t = " " + text.toLowerCase().replace(/[éè]/g, "e") + " ";
+  if (/^\s*(toutes|tout|all)\s*$/.test(t)) {
+    return ["economy", "premium-economy", "business", "first"];
+  }
+  const out = [];
+  const found = [
+    [/eco(nomy)?\s*premium|premium\s*eco(nomy)?|premium[- ]?economy|\bpremium\b/, "premium-economy"],
+    [/\baffaires?\b|\bbusiness\b|\bbiz\b/, "business"],
+    [/\bfirst\b|\bpremiere\b|\b1ere\b/, "first"]
+  ];
+  found.forEach(function (pair) {
+    if (pair[0].test(t)) {
+      out.push(pair[1]);
+      t = t.replace(pair[0], " ");
+    }
+  });
+  if (/\beco(nomy)?(nomique)?\b/.test(t)) out.unshift("economy");
+  return out.length > 0 ? out : null;
+}
+
 // Retourne 0/1/2… (max), null ("peu importe"), ou undefined (non reconnu).
 function parseTransfers_(text) {
   const t = text.trim().toLowerCase();
@@ -519,6 +597,7 @@ function listText_(cfg) {
     "🎯 Destinations : " + cfg.destinations.join(", ") + "\n" +
     "🛫 Départs : " + cfg.origins.join(", ") + " (" + expanded.length + " aéroports)\n" +
     "📅 Aller " + fmtWindow_(cfg.departWindow) + " · retour " + fmtWindow_(cfg.returnWindow) + "\n" +
+    "✈️ Billets : " + cfg.cabins.map(cabinLabel_).join(", ") + "\n" +
     "🌙 Séjour " + cfg.stayMin + "–" + cfg.stayMax + " nuits · 🔁 " +
     (cfg.maxTransfers === null ? "escales libres" : cfg.maxTransfers + " esc. max") +
     (cfg.budget !== null ? " · 💰 max " + cfg.budget + " " + cfg.currencies[0] : "") + "\n" +
@@ -565,7 +644,7 @@ function buildStatusText_(cfg) {
 
 function helpText_() {
   return "✈️ Flight Price Watch v" + SCRIPT_VERSION + "\n\n" +
-    "⭐ /config — assistant complet (7 questions)\n\n" +
+    "⭐ /config — assistant complet (8 questions)\n\n" +
     "🎯 Destinations\n" +
     "ICN — suivre un aéroport (ou /demarrer ICN)\n" +
     "/retirer ICN — ne plus le suivre\n\n" +
@@ -576,6 +655,7 @@ function helpText_() {
     "/retour 2026-10-19 2026-11-03 — fenêtre retour\n" +
     "/duree 14 21 — séjour min/max (nuits)\n\n" +
     "⚙️ Filtres & réglages\n" +
+    "/cabines eco affaires — type de billet\n" +
     "/escales 1 · /budget 700 · /devises EUR USD\n" +
     "/seuil 40 — alerte si prix 40% sous la moyenne\n" +
     "/pause · /reprendre\n\n" +
@@ -590,6 +670,10 @@ function checkPrices() {
   const cfg = getConfig_();
   if (cfg.paused) {
     Logger.log("Vérification ignorée : en pause.");
+    return;
+  }
+  if (cfg.cabins.indexOf("economy") === -1) {
+    Logger.log("Vérification éco ignorée : billets suivis = " + cfg.cabins.join(", ") + " (voir /cabines).");
     return;
   }
   runCheck_(cfg, cfg.destinations, false);
@@ -937,6 +1021,15 @@ function runPremiumCheck_(verbose) {
       return;
     }
 
+    // Cabines avant choisies dans l'onboarding (/cabines) — l'éco est gérée
+    // par le tracker principal, pas par ce module.
+    const cabins = cfg.cabins.filter(function (c) { return c !== "economy"; });
+    if (cabins.length === 0) {
+      Logger.log("Module premium : aucune cabine avant suivie (voir /cabines).");
+      if (verbose) replyTelegram_("Aucune cabine avant suivie. Ajoute-en avec /cabines (ex : /cabines eco affaires).");
+      return;
+    }
+
     const cur = cfg.currencies[0];
     const dates = premiumDates_(cfg);
     const origins = expandOrigins_(cfg.origins).slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
@@ -946,7 +1039,7 @@ function runPremiumCheck_(verbose) {
     const results = []; // { cabin, destination, price, origin, airlines, stops }
 
     cfg.destinations.forEach(function (dest) {
-      CONFIG_STATIC.PREMIUM_CABINS.forEach(function (cabin) {
+      cabins.forEach(function (cabin) {
         origins.forEach(function (origin) {
           try {
             const offers = fetchGoogleFlightsOffers_(origin, dest, cabin, cur, dates);
@@ -978,7 +1071,7 @@ function runPremiumCheck_(verbose) {
     const summaryLines = ["🥂 Cabines premium (" + fmtDate_(dates.depart) + "→" + fmtDate_(dates.ret) + ", " + cur + ")"];
     cfg.destinations.forEach(function (dest) {
       let destShown = false;
-      CONFIG_STATIC.PREMIUM_CABINS.forEach(function (cabin) {
+      cabins.forEach(function (cabin) {
         const forKey = results.filter(function (r) { return r.cabin === cabin && r.destination === dest; });
         if (forKey.length === 0) return;
         forKey.sort(function (a, b) { return a.price - b.price; });
@@ -1018,7 +1111,7 @@ function premiumDates_(cfg) {
 }
 
 function cabinLabel_(cabin) {
-  return { "premium-economy": "Éco premium", "business": "Affaires", "first": "Première" }[cabin] || cabin;
+  return { "economy": "Éco", "premium-economy": "Éco premium", "business": "Affaires", "first": "Première" }[cabin] || cabin;
 }
 
 function fetchGoogleFlightsOffers_(origin, destination, cabin, currency, dates) {
@@ -1215,6 +1308,7 @@ function defaultConfig_() {
     returnWindow: CONFIG_STATIC.DEFAULT_RETURN_WINDOW.slice(),
     stayMin: CONFIG_STATIC.DEFAULT_STAY[0],
     stayMax: CONFIG_STATIC.DEFAULT_STAY[1],
+    cabins: ["economy"],
     maxTransfers: null,
     budget: null,
     alertPct: CONFIG_STATIC.DEFAULT_ALERT_PCT,
