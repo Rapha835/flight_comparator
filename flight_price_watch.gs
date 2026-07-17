@@ -53,7 +53,7 @@
  * fermé le 17/07/2026 ; Travelpayouts = économie uniquement — voir v2.9.)
  */
 
-const SCRIPT_VERSION = "2.9";
+const SCRIPT_VERSION = "2.9.1";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -1190,7 +1190,7 @@ function runPremiumCheck_(verbose) {
 
     const cur = cfg.currencies[0];
     const dates = premiumDates_(cfg); // Duffel exige des dates précises
-    const origins = expandOrigins_(cfg.origins).slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
+    const origins = premiumOrigins_(cfg); // un hub par pays, spread géographique
     const sheet = getOrCreatePremiumSheet_();
     const now = new Date();
     const startMs = Date.now();
@@ -1200,9 +1200,11 @@ function runPremiumCheck_(verbose) {
     let emptyCount = 0;    // requêtes OK mais sans offre pour ce (route, cabine)
     let attempts = 0, failCount = 0, aborted = false, budgetHit = false;
 
-    cfg.destinations.forEach(function (dest) {
-      cabins.forEach(function (cabin) {
-        origins.forEach(function (origin) {
+    // Boucle ORIGINE-d'abord : chaque destination reçoit le meilleur hub avant
+    // qu'on approfondisse, pour que TOUTES soient couvertes malgré le budget.
+    origins.forEach(function (origin) {
+      cfg.destinations.forEach(function (dest) {
+        cabins.forEach(function (cabin) {
           if (aborted) return;
           // Garde-fous anti-timeout : plafond de recherches et budget-temps
           // (Duffel interroge les compagnies en direct, c'est lent).
@@ -1306,6 +1308,19 @@ function duffelCabin_(cabin) {
     "business": "business",
     "first": "first"
   }[cabin] || null;
+}
+
+/** Origines pour /premium : UN hub par pays/ville de départ (le 1er aéroport),
+ * pour un vrai spread géographique plutôt que 5 aéroports du même pays. Duffel
+ * étant lent, on plafonne à PREMIUM_MAX_ORIGINS pour tenir le budget-temps. */
+function premiumOrigins_(cfg) {
+  const out = [];
+  cfg.origins.forEach(function (entry) {
+    const code = entry.toUpperCase();
+    const hub = (code.length === 2 && COUNTRY_AIRPORTS[code]) ? COUNTRY_AIRPORTS[code][0] : code;
+    if (out.indexOf(hub) === -1) out.push(hub);
+  });
+  return out.slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
 }
 
 /** Duffel exige des dates précises : on échantillonne le début de la fenêtre
