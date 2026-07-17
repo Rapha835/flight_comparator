@@ -51,7 +51,7 @@
  * peut changer sa page), le suivi éco continue normalement.
  */
 
-const SCRIPT_VERSION = "2.6";
+const SCRIPT_VERSION = "2.7";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -1188,10 +1188,16 @@ function runPremiumCheck_(verbose) {
     const now = new Date();
     const premiumMins = getJson_("PREMIUM_MINS", {});
     const results = []; // { cabin, destination, price, origin, airlines, stops }
+    const failReasons = {}; // ex. { "mur de consentement Google": 12 }
+    let emptyCount = 0;    // requêtes OK mais sans offre pour ce (route, cabine)
+    let attempts = 0, blockFails = 0, aborted = false;
+    const BLOCKING_ = { "mur de consentement Google": 1, "bloqué anti-bot Google": 1, "structure ds:1 introuvable": 1 };
 
     cfg.destinations.forEach(function (dest) {
       cabins.forEach(function (cabin) {
         origins.forEach(function (origin) {
+          if (aborted) return;
+          attempts++;
           try {
             const offers = fetchGoogleFlightsOffers_(origin, dest, cabin, cur, dates);
             if (offers.length > 0) {
@@ -1201,18 +1207,38 @@ function runPremiumCheck_(verbose) {
                 now, origin, dest, cabin, best.price, cur,
                 best.airlines.join(" + "), best.stops, dates.depart, dates.ret
               ]);
+            } else {
+              emptyCount++;
             }
           } catch (e) {
+            const reason = String((e && e.message) || e);
+            failReasons[reason] = (failReasons[reason] || 0) + 1;
+            if (BLOCKING_[reason]) blockFails++;
             Logger.log("Module premium — échec pour " + origin + "→" + dest + "/" + cabin + " : " + e);
           }
+          // Google bloque les IP serveur : si les 6 premières requêtes échouent
+          // TOUTES sur un blocage, inutile d'en enchaîner 40 (timeout Apps Script).
+          if (results.length === 0 && attempts >= 6 && blockFails === attempts) aborted = true;
           Utilities.sleep(300);
         });
       });
     });
 
     if (results.length === 0) {
-      Logger.log("Module premium : aucun résultat cette fois-ci.");
-      if (verbose) replyTelegram_("😕 Aucun prix premium obtenu (Google Flights a pu bloquer la requête ou changer sa page). Réessaie plus tard.");
+      // On dit POURQUOI (jamais de fallback silencieux) : raison dominante +
+      // compte, pour distinguer un blocage Google d'une simple absence d'offre.
+      const reasonsSorted = Object.keys(failReasons).sort(function (a, b) {
+        return failReasons[b] - failReasons[a];
+      });
+      const diag = reasonsSorted.length
+        ? reasonsSorted.map(function (r) { return r + " (×" + failReasons[r] + ")"; }).join(", ")
+        : (emptyCount > 0 ? "aucune offre affaires/première sur ces dates" : "aucune requête envoyée");
+      Logger.log("Module premium : aucun résultat. Causes : " + diag);
+      if (verbose) {
+        replyTelegram_("😕 Aucun prix premium obtenu.\n\nCause : " + diag +
+          ".\n\nℹ️ « consentement » ou « anti-bot » = Google bloque les requêtes serveur d'Apps Script ; « aucune offre » = pas de vol dans cette cabine aux dates testées (" +
+          fmtDate_(dates.depart) + "→" + fmtDate_(dates.ret) + ").");
+      }
       return;
     }
 
@@ -1307,7 +1333,18 @@ function fetchGoogleFlightsOffers_(origin, destination, cabin, currency, dates) 
 
   const html = resp.getContentText();
   const scriptMatch = html.match(/<script class="ds:1"[^>]*>([\s\S]*?)<\/script>/);
-  if (!scriptMatch) throw new Error("structure ds:1 introuvable (Google a peut-être changé sa page)");
+  if (!scriptMatch) {
+    // Aide au diagnostic : depuis les IP de datacenter d'Apps Script, Google
+    // sert souvent un mur de consentement ou une page anti-bot SANS le bloc
+    // ds:1. On qualifie la cause au lieu d'un vague « structure introuvable ».
+    if (/unusual traffic|not a robot|detected unusual|sorry\/index|recaptcha/i.test(html)) {
+      throw new Error("bloqué anti-bot Google");
+    }
+    if (/consent\.google|before you continue|avant de continuer|isConsentBanner/i.test(html)) {
+      throw new Error("mur de consentement Google");
+    }
+    throw new Error("structure ds:1 introuvable");
+  }
 
   const js = scriptMatch[1];
   const idx = js.indexOf("data:");
