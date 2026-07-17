@@ -53,7 +53,7 @@
  * serveur d'Apps Script ; Amadeus self-service décommissionné le 17/07/2026.)
  */
 
-const SCRIPT_VERSION = "2.8";
+const SCRIPT_VERSION = "2.8.1";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -1339,9 +1339,15 @@ function fetchTravelpayoutsBusiness_(origin, destination, cabin, currency, month
 
   const resp = UrlFetchApp.fetch(url, { method: "get", muteHttpExceptions: true });
   const code = resp.getResponseCode();
-  if (code !== 200) throw new Error("Travelpayouts HTTP " + code);
+  const raw = resp.getContentText();
+  if (code !== 200) {
+    // On remonte le message exact de l'API (souvent le paramètre fautif).
+    let why = raw;
+    try { const e = JSON.parse(raw); why = e.error || e.message || raw; } catch (x) { /* corps non JSON */ }
+    throw new Error("Travelpayouts HTTP " + code + " : " + String(why).slice(0, 120));
+  }
 
-  const body = JSON.parse(resp.getContentText());
+  const body = JSON.parse(raw);
   if (!body || body.success === false) {
     throw new Error("Travelpayouts : " + ((body && body.error) || "réponse invalide"));
   }
