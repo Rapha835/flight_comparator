@@ -13,9 +13,9 @@
  *   type de billet (éco / éco premium / affaires / first) · escales max ·
  *   budget max (avec repère : meilleur prix et moyenne constatés)
  *
- * L'éco est suivie toutes les 30 min via l'API ; les cabines avant (affaires,
- * première) 1x/jour + /premium à la demande, via Travelpayouts trip_class
- * (données en cache ; l'éco premium n'est pas couverte).
+ * L'éco est suivie toutes les 30 min via l'API Travelpayouts ; les cabines
+ * avant (éco premium, affaires, première) 1x/jour + /premium à la demande, via
+ * l'API Duffel (vraies offres live, toutes cabines).
  *
  * Alertes Telegram uniquement quand :
  *   - un prix bat son record historique (par destination + devise), ou
@@ -45,21 +45,27 @@
  * Francfort). Le script étend donc lui-même chaque code pays via
  * COUNTRY_AIRPORTS ci-dessous.
  *
- * MODULE COMPLÉMENTAIRE — cabines premium (affaires / première) : API
- * Travelpayouts (v2/prices/latest, trip_class=1/2), 1x/jour + à la demande via
- * /premium, entièrement isolé par try/catch. Données en cache par mois. Ne
- * couvre PAS l'éco premium. Si l'API échoue, le suivi éco continue normalement.
- * (Historique : scraping Google Flights jusqu'en v2.7 — Google bloque les IP
- * serveur d'Apps Script ; Amadeus self-service décommissionné le 17/07/2026.)
+ * MODULE COMPLÉMENTAIRE — cabines premium (éco premium / affaires / première) :
+ * API Duffel (offres live, toutes cabines), 1x/jour + à la demande via
+ * /premium, entièrement isolé par try/catch. Si l'API échoue, le suivi éco
+ * continue normalement. (Historique des sources abandonnées pour les cabines
+ * avant : scraping Google Flights bloqué anti-bot ; Amadeus self-service
+ * fermé le 17/07/2026 ; Travelpayouts = économie uniquement — voir v2.9.)
  */
 
-const SCRIPT_VERSION = "2.8.1";
+const SCRIPT_VERSION = "2.9";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
   TRAVELPAYOUTS_TOKEN: "COLLE_TON_TOKEN_TRAVELPAYOUTS_ICI",
   TELEGRAM_BOT_TOKEN: "COLLE_TON_TOKEN_TELEGRAM_ICI",
   TELEGRAM_CHAT_ID: "COLLE_TON_CHAT_ID_ICI",
+
+  // --- API Duffel (cabines avant : éco premium / affaires / première) ---
+  // Crée un compte sur duffel.com. Le mode TEST renvoie des données FICTIVES
+  // (compagnie « Duffel Airways ») : passe ton compte en LIVE et colle ici le
+  // jeton d'accès LIVE (commence par « duffel_live_… ») pour de vrais prix.
+  DUFFEL_TOKEN: "COLLE_TON_JETON_DUFFEL_LIVE_ICI",
 
   // Nom du fichier Google Sheet dans ton Drive (réutilisé s'il existe déjà).
   SHEET_NAME: "Historique prix vols",
@@ -94,7 +100,12 @@ const CONFIG_STATIC = {
   // --- Module cabines avant (éco premium / affaires / first) ---
   // Les cabines suivies se choisissent dans l'onboarding ou via /cabines.
   PREMIUM_ENABLED: true, // false = ne crée jamais le trigger quotidien
-  PREMIUM_MAX_ORIGINS: 5 // limite le nombre de villes interrogées par cabine
+  PREMIUM_MAX_ORIGINS: 5,  // villes de départ interrogées par cabine
+  // Duffel interroge les compagnies en direct (~10-15 s/route). On plafonne le
+  // nombre de recherches ET le temps total pour rester sous la limite Apps
+  // Script (6 min) : au-delà, /premium renvoie ce qu'il a déjà trouvé.
+  PREMIUM_MAX_REQUESTS: 18,
+  PREMIUM_TIME_BUDGET_MS: 270000 // 4 min 30
 };
 
 // Code pays (ISO 3166-1 alpha-2) → aéroports principaux avec une vraie
@@ -435,26 +446,18 @@ function priceHint_(cfg, cabin) {
     const cur = cfg.currencies[0];
 
     // Cabines avant : dernier relevé premium si dispo (toutes destinations),
-    // sinon sondage Travelpayouts sur 2 villes (best effort, ménage le quota).
+    // sinon on invite à /premium (pas de sondage live : Duffel est trop lent
+    // pour bloquer l'assistant pendant une question).
     if (cabin && cabin !== "economy") {
       const prem = getJson_("LAST_PREMIUM", null);
       for (let i = 0; i < cfg.destinations.length; i++) {
         const d = cfg.destinations[i];
         if (prem && prem.results && prem.results[cabin + "|" + d]) {
           const known = prem.results[cabin + "|" + d];
-          return "\n📊 Repère " + cabinLabel_(cabin) + " " + d + " : " + known.price + " " + prem.currency + " (" + known.origin + ")";
+          return "\n📊 Repère " + cabinLabel_(cabin) + " " + d + " : " + known.price + " " + known.currency + " (" + known.origin + ")";
         }
       }
-      const monthStart = cfg.departWindow[0].substring(0, 7) + "-01";
-      const premPrices = [];
-      expandOrigins_(cfg.origins).slice(0, 2).forEach(function (origin) {
-        try {
-          const offers = fetchTravelpayoutsBusiness_(origin, cfg.destinations[0], cabin, cur, monthStart);
-          if (offers.length > 0) premPrices.push(offers[0].price);
-        } catch (e) { /* cache non garanti : le repère est facultatif */ }
-      });
-      if (premPrices.length === 0) return "\n(pas de repère dispo pour cette cabine — essaie /premium après la config)";
-      return "\n📊 Repère " + cabinLabel_(cabin) + " " + cfg.destinations[0] + " : meilleur constaté " + Math.min.apply(null, premPrices) + " " + cur;
+      return "\n(pas de repère dispo pour cette cabine — essaie /premium après la config)";
     }
 
     // Éco — sources par ordre de fraîcheur/fiabilité :
@@ -712,10 +715,10 @@ function buildStatusText_(cfg) {
   // Cabines premium (dernier relevé quotidien ou /premium)
   const prem = getJson_("LAST_PREMIUM", null);
   if (prem && prem.results && Object.keys(prem.results).length > 0) {
-    lines.push("\n🥂 Cabines (" + fmtDateTime_(prem.checkedAt) + ", " + prem.currency + ") :");
+    lines.push("\n🥂 Cabines (" + fmtDateTime_(prem.checkedAt) + ") :");
     Object.keys(prem.results).sort().forEach(function (k) {
       const p = prem.results[k];
-      lines.push(cabinLabel_(p.cabin) + " " + p.destination + " : " + p.price + " (" + p.origin + ", " + p.stops + " esc.)");
+      lines.push(cabinLabel_(p.cabin) + " " + p.destination + " : " + p.price + " " + (p.currency || "") + " (" + p.origin + ", " + p.stops + " esc.)");
     });
   } else if (CONFIG_STATIC.PREMIUM_ENABLED) {
     lines.push("\n🥂 Cabines premium : pas encore de relevé — envoie /premium.");
@@ -744,7 +747,7 @@ function helpText_() {
     "/pause · /reprendre\n\n" +
     "🔍 Consulter\n" +
     "/check — vérifier maintenant\n" +
-    "/premium — prix affaires/première\n" +
+    "/premium — prix cabines avant (éco premium / affaires / première)\n" +
     "/status — derniers prix · /liste — config";
 }
 
@@ -1148,11 +1151,12 @@ function toQuery_(params) {
 
 /**
  * ============ MODULE COMPLÉMENTAIRE : CABINES PREMIUM ============
- * Prix par cabine AVANT (affaires / première) via Travelpayouts
- * v2/prices/latest avec trip_class=1/2 — données EN CACHE par mois de départ.
- * L'éco premium n'est pas couverte par cette API. Volontairement peu fréquent
- * (1x/jour + /premium à la demande), et TOUT est protégé par des try/catch —
- * si l'API échoue ou n'a rien en cache, le suivi éco principal continue.
+ * Prix par cabine AVANT (éco premium / affaires / première) via l'API Duffel :
+ * de vraies offres LIVE interrogées auprès des compagnies. Duffel cherche en
+ * direct (~10-15 s/route) → on plafonne le nombre de recherches et le temps
+ * total (voir CONFIG_STATIC). Volontairement peu fréquent (1x/jour + /premium
+ * à la demande), et TOUT est protégé par des try/catch — si l'API échoue, le
+ * suivi éco principal continue sans interruption.
  */
 
 /** Trigger quotidien (l'événement du trigger est ignoré). */
@@ -1174,45 +1178,46 @@ function runPremiumCheck_(verbose) {
     }
 
     // Cabines avant choisies dans l'onboarding (/cabines) — l'éco est gérée
-    // par le tracker principal, pas par ce module. Travelpayouts ne couvre que
-    // l'affaires (1) et la première (2), PAS l'éco premium : on l'écarte.
+    // par le tracker principal, pas par ce module. Duffel couvre toutes les
+    // cabines avant (éco premium, affaires, première).
     const wanted = cfg.cabins.filter(function (c) { return c !== "economy"; });
-    const cabins = wanted.filter(function (c) { return tripClassFor_(c) !== null; });
-    const dropped = wanted.filter(function (c) { return tripClassFor_(c) === null; });
+    const cabins = wanted.filter(function (c) { return duffelCabin_(c) !== null; });
     if (cabins.length === 0) {
-      Logger.log("Module premium : aucune cabine avant couverte par Travelpayouts.");
-      if (verbose) {
-        replyTelegram_(wanted.length === 0
-          ? "Aucune cabine avant suivie. Ajoute-en avec /cabines (ex : /cabines eco affaires)."
-          : "ℹ️ Travelpayouts ne couvre que l'affaires et la première — " +
-            dropped.map(cabinLabel_).join("/") + " non dispo. Essaie /cabines eco affaires.");
-      }
+      Logger.log("Module premium : aucune cabine avant suivie (voir /cabines).");
+      if (verbose) replyTelegram_("Aucune cabine avant suivie. Ajoute-en avec /cabines (ex : /cabines eco affaires).");
       return;
     }
 
     const cur = cfg.currencies[0];
-    const monthStart = cfg.departWindow[0].substring(0, 7) + "-01"; // cache par mois
+    const dates = premiumDates_(cfg); // Duffel exige des dates précises
     const origins = expandOrigins_(cfg.origins).slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
     const sheet = getOrCreatePremiumSheet_();
     const now = new Date();
+    const startMs = Date.now();
     const premiumMins = getJson_("PREMIUM_MINS", {});
-    const results = []; // { cabin, destination, price, origin, airlines, stops, departure_at, return_at }
-    const failReasons = {}; // ex. { "Travelpayouts HTTP 429": 6 }
+    const results = []; // { cabin, destination, price, currency, origin, airlines, stops, departure_at, return_at }
+    const failReasons = {}; // ex. { "Duffel offers HTTP 401 : ...": 6 }
     let emptyCount = 0;    // requêtes OK mais sans offre pour ce (route, cabine)
-    let attempts = 0, failCount = 0, aborted = false;
+    let attempts = 0, failCount = 0, aborted = false, budgetHit = false;
 
     cfg.destinations.forEach(function (dest) {
       cabins.forEach(function (cabin) {
         origins.forEach(function (origin) {
           if (aborted) return;
+          // Garde-fous anti-timeout : plafond de recherches et budget-temps
+          // (Duffel interroge les compagnies en direct, c'est lent).
+          if (attempts >= CONFIG_STATIC.PREMIUM_MAX_REQUESTS ||
+              (Date.now() - startMs) > CONFIG_STATIC.PREMIUM_TIME_BUDGET_MS) {
+            budgetHit = true; aborted = true; return;
+          }
           attempts++;
           try {
-            const offers = fetchTravelpayoutsBusiness_(origin, dest, cabin, cur, monthStart);
+            const offers = fetchDuffelBusiness_(origin, dest, cabin, dates);
             if (offers.length > 0) {
               const best = offers[0];
               results.push(best);
               sheet.appendRow([
-                now, origin, dest, cabin, best.price, cur,
+                now, origin, dest, cabin, best.price, best.currency,
                 best.airlines.join(" + "), best.stops, best.departure_at, best.return_at
               ]);
             } else {
@@ -1224,12 +1229,12 @@ function runPremiumCheck_(verbose) {
             failCount++;
             Logger.log("Module premium — échec pour " + origin + "→" + dest + "/" + cabin + " : " + e);
           }
-          // Panne systémique (ex. HTTP 429/401 Travelpayouts) : si les 6
-          // premières requêtes échouent TOUTES sur la même erreur, on coupe.
-          // Une simple absence d'offre (emptyCount) ne déclenche pas l'arrêt.
-          if (results.length === 0 && attempts >= 6 && failCount === attempts &&
+          // Panne systémique (ex. HTTP 401/403 Duffel) : si les 4 premières
+          // requêtes échouent TOUTES sur la même erreur, on coupe (inutile de
+          // brûler du temps). Une simple absence d'offre ne déclenche rien.
+          if (results.length === 0 && attempts >= 4 && failCount === attempts &&
               Object.keys(failReasons).length === 1) aborted = true;
-          Utilities.sleep(300);
+          Utilities.sleep(200);
         });
       });
     });
@@ -1242,20 +1247,21 @@ function runPremiumCheck_(verbose) {
       });
       const diag = reasonsSorted.length
         ? reasonsSorted.map(function (r) { return r + " (×" + failReasons[r] + ")"; }).join(", ")
-        : (emptyCount > 0 ? "aucune offre en cache pour ces cabines ce mois-ci" : "aucune requête envoyée");
+        : (emptyCount > 0 ? "aucune offre sur ces routes/dates" : "aucune requête envoyée");
       Logger.log("Module premium : aucun résultat. Causes : " + diag);
       if (verbose) {
         replyTelegram_("😕 Aucun prix premium obtenu.\n\nCause : " + diag +
-          ".\n\nℹ️ « HTTP … » = souci d'accès Travelpayouts (token/quota) ; « aucune offre » = pas de prix affaires/première en cache pour " +
-          monthStart.substring(0, 7) + ". Les cabines avant sont peu mises en cache : il se peut qu'il n'y ait simplement rien.");
+          ".\n\nℹ️ « HTTP 401/403 » = jeton Duffel invalide ou en mode test ; « aucune offre » = pas de vol dans cette cabine aux dates testées (" +
+          fmtDate_(dates.depart) + "→" + fmtDate_(dates.ret) + ").");
       }
       return;
     }
 
     // Meilleur prix par (cabine, destination), alertes sur nouveaux records —
-    // jamais au tout premier relevé (référence seulement).
-    const lastPremium = { checkedAt: now.toISOString(), currency: cur, results: {} };
-    const summaryLines = ["🥂 Cabines premium (départs " + monthStart.substring(0, 7) + ", " + cur + ")"];
+    // jamais au tout premier relevé (référence seulement). Duffel fixe lui-même
+    // la devise de chaque offre : on l'affiche et on l'inclut dans les clés.
+    const lastPremium = { checkedAt: now.toISOString(), results: {} };
+    const summaryLines = ["🥂 Cabines premium (" + fmtDate_(dates.depart) + "→" + fmtDate_(dates.ret) + ")"];
     cfg.destinations.forEach(function (dest) {
       let destShown = false;
       cabins.forEach(function (cabin) {
@@ -1265,15 +1271,16 @@ function runPremiumCheck_(verbose) {
         const best = forKey[0];
         if (!destShown) { summaryLines.push("\n🎯 " + dest); destShown = true; }
         const cabBudget = budgetFor_(cfg, cabin);
-        summaryLines.push(cabinLabel_(cabin) + " : " + best.price + " (" + best.origin + ", " + best.stops + " esc.)" +
-          (cabBudget !== null && best.price > cabBudget ? " ⚠️ > " + cabBudget : ""));
+        const overBudget = cabBudget !== null && best.currency === cur && best.price > cabBudget;
+        summaryLines.push(cabinLabel_(cabin) + " : " + best.price + " " + best.currency +
+          " (" + best.origin + ", " + best.stops + " esc.)" + (overBudget ? " ⚠️ > " + cabBudget : ""));
         lastPremium.results[cabin + "|" + dest] = best;
 
-        const key = cabin + "|" + dest + "|" + cur;
+        const key = cabin + "|" + dest + "|" + best.currency;
         const prevMin = (key in premiumMins) ? premiumMins[key] : null;
         if (prevMin === null || best.price < prevMin) {
           premiumMins[key] = best.price;
-          if (prevMin !== null && !verbose) sendPremiumAlert_(best, prevMin, cur);
+          if (prevMin !== null && !verbose) sendPremiumAlert_(best, prevMin, best.currency);
         }
       });
     });
@@ -1281,8 +1288,8 @@ function runPremiumCheck_(verbose) {
     setJson_("LAST_PREMIUM", lastPremium);
 
     if (verbose) replyTelegram_(summaryLines.join("\n") +
-      (dropped.length ? "\n\nℹ️ " + dropped.map(cabinLabel_).join("/") + " non couverte(s) par Travelpayouts." : "") +
-      "\n\nℹ️ Prix Travelpayouts en cache — vérifie le prix exact avant de réserver.");
+      (budgetHit ? "\n\n⏱️ Recherche écourtée (plafond de temps/requêtes) — résultats partiels." : "") +
+      "\n\nℹ️ Offres live Duffel — vérifie le prix exact avant de réserver.");
   } catch (e) {
     // Filet de sécurité global : quoi qu'il arrive, ce module ne doit
     // jamais faire planter le trigger ni affecter le suivi éco.
@@ -1291,11 +1298,24 @@ function runPremiumCheck_(verbose) {
   }
 }
 
-/** Cabine → trip_class Travelpayouts. Renvoie null pour l'éco premium (non
- * couverte) et l'éco (gérée par le tracker principal). */
-function tripClassFor_(cabin) {
-  const map = { "business": 1, "first": 2 };
-  return (cabin in map) ? map[cabin] : null;
+/** Cabine interne → valeur cabin_class de Duffel. Renvoie null pour l'éco
+ * (gérée par le tracker principal, jamais interrogée ici). */
+function duffelCabin_(cabin) {
+  return {
+    "premium-economy": "premium_economy",
+    "business": "business",
+    "first": "first"
+  }[cabin] || null;
+}
+
+/** Duffel exige des dates précises : on échantillonne le début de la fenêtre
+ * de départ + un séjour moyen (comme le faisait l'ancien module). */
+function premiumDates_(cfg) {
+  const depart = cfg.departWindow[0];
+  const days = Math.round((cfg.stayMin + cfg.stayMax) / 2);
+  const d = new Date(depart + "T12:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return { depart: depart, ret: d.toISOString().substring(0, 10) };
 }
 
 function budgetsLabel_(cfg) {
@@ -1314,55 +1334,85 @@ function cabinLabel_(cabin) {
   return { "economy": "Éco", "premium-economy": "Éco premium", "business": "Affaires", "first": "Première" }[cabin] || cabin;
 }
 
-/** Prix affaires/première via Travelpayouts v2/prices/latest (trip_class=1/2).
- * Données EN CACHE pour le mois `monthStart` (YYYY-MM-01), aller-retour.
- * Renvoie la même forme que l'ancien scraping, plus les dates trouvées :
- *   { cabin, origin, destination, price, airlines, stops, departure_at, return_at }. */
-function fetchTravelpayoutsBusiness_(origin, destination, cabin, currency, monthStart) {
-  const tripClass = tripClassFor_(cabin);
-  if (tripClass === null) throw new Error(cabinLabel_(cabin) + " non couverte par Travelpayouts");
+/** Extrait un message lisible d'une réponse d'erreur Duffel (JSON {errors:[…]}). */
+function duffelErr_(raw) {
+  try {
+    const e = JSON.parse(raw);
+    if (e.errors && e.errors[0]) {
+      return (e.errors[0].title || "erreur") +
+        (e.errors[0].message ? " — " + e.errors[0].message : "");
+    }
+  } catch (x) { /* corps non JSON */ }
+  return String(raw).slice(0, 120);
+}
 
-  const params = {
-    origin: origin,
-    destination: destination,
-    currency: currency.toLowerCase(),
-    beginning_of_period: monthStart,
-    period_type: "month",
-    trip_class: tripClass,
-    one_way: "false",
-    sorting: "price",
-    limit: "30",
-    page: "1",
-    token: CONFIG_STATIC.TRAVELPAYOUTS_TOKEN
+/** Offres aller-retour d'une cabine avant via l'API Duffel (offres LIVE).
+ * 1) crée une demande d'offres, 2) récupère les offres triées par prix.
+ * Renvoie [{ cabin, origin, destination, price, currency, airlines, stops,
+ * departure_at, return_at }] triées du moins cher au plus cher. */
+function fetchDuffelBusiness_(origin, destination, cabin, dates) {
+  const cabinClass = duffelCabin_(cabin);
+  if (cabinClass === null) throw new Error(cabinLabel_(cabin) + " non gérée");
+
+  const headers = {
+    "Authorization": "Bearer " + CONFIG_STATIC.DUFFEL_TOKEN,
+    "Duffel-Version": "v2",
+    "Accept": "application/json"
   };
-  const url = "https://api.travelpayouts.com/v2/prices/latest?" + toQuery_(params);
 
-  const resp = UrlFetchApp.fetch(url, { method: "get", muteHttpExceptions: true });
-  const code = resp.getResponseCode();
-  const raw = resp.getContentText();
-  if (code !== 200) {
-    // On remonte le message exact de l'API (souvent le paramètre fautif).
-    let why = raw;
-    try { const e = JSON.parse(raw); why = e.error || e.message || raw; } catch (x) { /* corps non JSON */ }
-    throw new Error("Travelpayouts HTTP " + code + " : " + String(why).slice(0, 120));
+  // 1) Demande d'offres (return_offers=false : on récupère juste l'id, puis on
+  // trie/pagine côté serveur). supplier_timeout borne l'attente des compagnies.
+  const reqBody = {
+    data: {
+      slices: [
+        { origin: origin, destination: destination, departure_date: dates.depart },
+        { origin: destination, destination: origin, departure_date: dates.ret }
+      ],
+      passengers: [{ type: "adult" }],
+      cabin_class: cabinClass
+    }
+  };
+  const createResp = UrlFetchApp.fetch(
+    "https://api.duffel.com/air/offer_requests?return_offers=false&supplier_timeout=12000", {
+      method: "post",
+      contentType: "application/json",
+      headers: headers,
+      payload: JSON.stringify(reqBody),
+      muteHttpExceptions: true
+    });
+  const cCode = createResp.getResponseCode();
+  const cRaw = createResp.getContentText();
+  if (cCode !== 201 && cCode !== 200) {
+    throw new Error("Duffel create HTTP " + cCode + " : " + duffelErr_(cRaw));
   }
+  const created = JSON.parse(cRaw);
+  const reqId = created.data && created.data.id;
+  if (!reqId) throw new Error("Duffel : pas d'offer_request id");
 
-  const body = JSON.parse(raw);
-  if (!body || body.success === false) {
-    throw new Error("Travelpayouts : " + ((body && body.error) || "réponse invalide"));
-  }
+  // 2) Offres triées par prix croissant.
+  const offersResp = UrlFetchApp.fetch(
+    "https://api.duffel.com/air/offers?offer_request_id=" + encodeURIComponent(reqId) +
+    "&sort=total_amount&limit=20", {
+      method: "get", headers: headers, muteHttpExceptions: true
+    });
+  const oCode = offersResp.getResponseCode();
+  const oRaw = offersResp.getContentText();
+  if (oCode !== 200) throw new Error("Duffel offers HTTP " + oCode + " : " + duffelErr_(oRaw));
 
-  const rows = (body && body.data) || [];
-  const out = rows.map(function (r) {
+  const offers = (JSON.parse(oRaw).data) || [];
+  const out = offers.map(function (o) {
+    const outbound = (o.slices && o.slices[0] && o.slices[0].segments) || [];
+    const airline = (o.owner && (o.owner.name || o.owner.iata_code)) || "?";
     return {
       cabin: cabin,
       origin: origin,
       destination: destination,
-      price: Math.round(r.value),
-      airlines: r.airline ? [r.airline] : [],
-      stops: (typeof r.number_of_changes === "number") ? r.number_of_changes : 0,
-      departure_at: r.depart_date || monthStart,
-      return_at: r.return_date || ""
+      price: Math.round(parseFloat(o.total_amount)),
+      currency: o.total_currency,
+      airlines: [airline],
+      stops: Math.max(0, outbound.length - 1),
+      departure_at: dates.depart,
+      return_at: dates.ret
     };
   });
   out.sort(function (a, b) { return a.price - b.price; });
@@ -1373,7 +1423,7 @@ function sendPremiumAlert_(best, previousMin, cur) {
   const msg = "🥂 Record battu — " + cabinLabel_(best.cabin) + " " + best.destination + " !\n\n" +
     "💰 " + best.price + " " + cur + " (record précédent : " + previousMin + ")\n" +
     "🛫 " + best.origin + " → " + best.destination + " · " + best.stops + " esc. · " + best.airlines.join(" + ") + "\n\n" +
-    "ℹ️ Prix Travelpayouts en cache — vérifie avant de réserver.";
+    "ℹ️ Offre live Duffel — vérifie avant de réserver.";
   replyTelegram_(msg);
 }
 
