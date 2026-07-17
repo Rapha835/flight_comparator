@@ -13,9 +13,9 @@
  *   type de billet (éco / éco premium / affaires / first) · escales max ·
  *   budget max (avec repère : meilleur prix et moyenne constatés)
  *
- * L'éco est suivie toutes les 30 min via l'API ; les cabines avant (éco
- * premium, affaires, first) 1x/jour + /premium à la demande, via le module
- * Google Flights (limite du scraping gratuit).
+ * L'éco est suivie toutes les 30 min via l'API ; les cabines avant (affaires,
+ * première) 1x/jour + /premium à la demande, via Travelpayouts trip_class
+ * (données en cache ; l'éco premium n'est pas couverte).
  *
  * Alertes Telegram uniquement quand :
  *   - un prix bat son record historique (par destination + devise), ou
@@ -45,13 +45,15 @@
  * Francfort). Le script étend donc lui-même chaque code pays via
  * COUNTRY_AIRPORTS ci-dessous.
  *
- * MODULE COMPLÉMENTAIRE — cabines premium (éco premium / affaires /
- * première) : scraping non officiel de Google Flights, 1x/jour + à la
- * demande via /premium, entièrement isolé par try/catch. S'il casse (Google
- * peut changer sa page), le suivi éco continue normalement.
+ * MODULE COMPLÉMENTAIRE — cabines premium (affaires / première) : API
+ * Travelpayouts (v2/prices/latest, trip_class=1/2), 1x/jour + à la demande via
+ * /premium, entièrement isolé par try/catch. Données en cache par mois. Ne
+ * couvre PAS l'éco premium. Si l'API échoue, le suivi éco continue normalement.
+ * (Historique : scraping Google Flights jusqu'en v2.7 — Google bloque les IP
+ * serveur d'Apps Script ; Amadeus self-service décommissionné le 17/07/2026.)
  */
 
-const SCRIPT_VERSION = "2.7";
+const SCRIPT_VERSION = "2.8";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -92,7 +94,7 @@ const CONFIG_STATIC = {
   // --- Module cabines avant (éco premium / affaires / first) ---
   // Les cabines suivies se choisissent dans l'onboarding ou via /cabines.
   PREMIUM_ENABLED: true, // false = ne crée jamais le trigger quotidien
-  PREMIUM_MAX_ORIGINS: 5 // limite le nombre de villes interrogées (volume = risque de blocage)
+  PREMIUM_MAX_ORIGINS: 5 // limite le nombre de villes interrogées par cabine
 };
 
 // Code pays (ISO 3166-1 alpha-2) → aéroports principaux avec une vraie
@@ -433,7 +435,7 @@ function priceHint_(cfg, cabin) {
     const cur = cfg.currencies[0];
 
     // Cabines avant : dernier relevé premium si dispo (toutes destinations),
-    // sinon sondage Google Flights sur 3 villes (~10 s, best effort).
+    // sinon sondage Travelpayouts sur 2 villes (best effort, ménage le quota).
     if (cabin && cabin !== "economy") {
       const prem = getJson_("LAST_PREMIUM", null);
       for (let i = 0; i < cfg.destinations.length; i++) {
@@ -443,13 +445,13 @@ function priceHint_(cfg, cabin) {
           return "\n📊 Repère " + cabinLabel_(cabin) + " " + d + " : " + known.price + " " + prem.currency + " (" + known.origin + ")";
         }
       }
-      const dates = premiumDates_(cfg);
+      const monthStart = cfg.departWindow[0].substring(0, 7) + "-01";
       const premPrices = [];
-      expandOrigins_(cfg.origins).slice(0, 3).forEach(function (origin) {
+      expandOrigins_(cfg.origins).slice(0, 2).forEach(function (origin) {
         try {
-          const offers = fetchGoogleFlightsOffers_(origin, cfg.destinations[0], cabin, cur, dates);
+          const offers = fetchTravelpayoutsBusiness_(origin, cfg.destinations[0], cabin, cur, monthStart);
           if (offers.length > 0) premPrices.push(offers[0].price);
-        } catch (e) { /* scraping non garanti : le repère est facultatif */ }
+        } catch (e) { /* cache non garanti : le repère est facultatif */ }
       });
       if (premPrices.length === 0) return "\n(pas de repère dispo pour cette cabine — essaie /premium après la config)";
       return "\n📊 Repère " + cabinLabel_(cabin) + " " + cfg.destinations[0] + " : meilleur constaté " + Math.min.apply(null, premPrices) + " " + cur;
@@ -1146,12 +1148,11 @@ function toQuery_(params) {
 
 /**
  * ============ MODULE COMPLÉMENTAIRE : CABINES PREMIUM ============
- * Interroge directement Google Flights (comme le ferait ton navigateur)
- * pour obtenir des prix par cabine (éco premium / affaires / première),
- * ce que l'API Travelpayouts ne sait pas faire. Scraping non officiel :
- * volontairement peu fréquent (1x/jour + /premium à la demande), et TOUT est
- * protégé par des try/catch — si Google bloque ou change sa page, ce module
- * échoue en silence et le suivi éco principal continue sans interruption.
+ * Prix par cabine AVANT (affaires / première) via Travelpayouts
+ * v2/prices/latest avec trip_class=1/2 — données EN CACHE par mois de départ.
+ * L'éco premium n'est pas couverte par cette API. Volontairement peu fréquent
+ * (1x/jour + /premium à la demande), et TOUT est protégé par des try/catch —
+ * si l'API échoue ou n'a rien en cache, le suivi éco principal continue.
  */
 
 /** Trigger quotidien (l'événement du trigger est ignoré). */
@@ -1173,25 +1174,32 @@ function runPremiumCheck_(verbose) {
     }
 
     // Cabines avant choisies dans l'onboarding (/cabines) — l'éco est gérée
-    // par le tracker principal, pas par ce module.
-    const cabins = cfg.cabins.filter(function (c) { return c !== "economy"; });
+    // par le tracker principal, pas par ce module. Travelpayouts ne couvre que
+    // l'affaires (1) et la première (2), PAS l'éco premium : on l'écarte.
+    const wanted = cfg.cabins.filter(function (c) { return c !== "economy"; });
+    const cabins = wanted.filter(function (c) { return tripClassFor_(c) !== null; });
+    const dropped = wanted.filter(function (c) { return tripClassFor_(c) === null; });
     if (cabins.length === 0) {
-      Logger.log("Module premium : aucune cabine avant suivie (voir /cabines).");
-      if (verbose) replyTelegram_("Aucune cabine avant suivie. Ajoute-en avec /cabines (ex : /cabines eco affaires).");
+      Logger.log("Module premium : aucune cabine avant couverte par Travelpayouts.");
+      if (verbose) {
+        replyTelegram_(wanted.length === 0
+          ? "Aucune cabine avant suivie. Ajoute-en avec /cabines (ex : /cabines eco affaires)."
+          : "ℹ️ Travelpayouts ne couvre que l'affaires et la première — " +
+            dropped.map(cabinLabel_).join("/") + " non dispo. Essaie /cabines eco affaires.");
+      }
       return;
     }
 
     const cur = cfg.currencies[0];
-    const dates = premiumDates_(cfg);
+    const monthStart = cfg.departWindow[0].substring(0, 7) + "-01"; // cache par mois
     const origins = expandOrigins_(cfg.origins).slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
     const sheet = getOrCreatePremiumSheet_();
     const now = new Date();
     const premiumMins = getJson_("PREMIUM_MINS", {});
-    const results = []; // { cabin, destination, price, origin, airlines, stops }
-    const failReasons = {}; // ex. { "mur de consentement Google": 12 }
+    const results = []; // { cabin, destination, price, origin, airlines, stops, departure_at, return_at }
+    const failReasons = {}; // ex. { "Travelpayouts HTTP 429": 6 }
     let emptyCount = 0;    // requêtes OK mais sans offre pour ce (route, cabine)
-    let attempts = 0, blockFails = 0, aborted = false;
-    const BLOCKING_ = { "mur de consentement Google": 1, "bloqué anti-bot Google": 1, "structure ds:1 introuvable": 1 };
+    let attempts = 0, failCount = 0, aborted = false;
 
     cfg.destinations.forEach(function (dest) {
       cabins.forEach(function (cabin) {
@@ -1199,13 +1207,13 @@ function runPremiumCheck_(verbose) {
           if (aborted) return;
           attempts++;
           try {
-            const offers = fetchGoogleFlightsOffers_(origin, dest, cabin, cur, dates);
+            const offers = fetchTravelpayoutsBusiness_(origin, dest, cabin, cur, monthStart);
             if (offers.length > 0) {
               const best = offers[0];
               results.push(best);
               sheet.appendRow([
                 now, origin, dest, cabin, best.price, cur,
-                best.airlines.join(" + "), best.stops, dates.depart, dates.ret
+                best.airlines.join(" + "), best.stops, best.departure_at, best.return_at
               ]);
             } else {
               emptyCount++;
@@ -1213,12 +1221,14 @@ function runPremiumCheck_(verbose) {
           } catch (e) {
             const reason = String((e && e.message) || e);
             failReasons[reason] = (failReasons[reason] || 0) + 1;
-            if (BLOCKING_[reason]) blockFails++;
+            failCount++;
             Logger.log("Module premium — échec pour " + origin + "→" + dest + "/" + cabin + " : " + e);
           }
-          // Google bloque les IP serveur : si les 6 premières requêtes échouent
-          // TOUTES sur un blocage, inutile d'en enchaîner 40 (timeout Apps Script).
-          if (results.length === 0 && attempts >= 6 && blockFails === attempts) aborted = true;
+          // Panne systémique (ex. HTTP 429/401 Travelpayouts) : si les 6
+          // premières requêtes échouent TOUTES sur la même erreur, on coupe.
+          // Une simple absence d'offre (emptyCount) ne déclenche pas l'arrêt.
+          if (results.length === 0 && attempts >= 6 && failCount === attempts &&
+              Object.keys(failReasons).length === 1) aborted = true;
           Utilities.sleep(300);
         });
       });
@@ -1226,18 +1236,18 @@ function runPremiumCheck_(verbose) {
 
     if (results.length === 0) {
       // On dit POURQUOI (jamais de fallback silencieux) : raison dominante +
-      // compte, pour distinguer un blocage Google d'une simple absence d'offre.
+      // compte, pour distinguer un souci d'accès d'une simple absence d'offre.
       const reasonsSorted = Object.keys(failReasons).sort(function (a, b) {
         return failReasons[b] - failReasons[a];
       });
       const diag = reasonsSorted.length
         ? reasonsSorted.map(function (r) { return r + " (×" + failReasons[r] + ")"; }).join(", ")
-        : (emptyCount > 0 ? "aucune offre affaires/première sur ces dates" : "aucune requête envoyée");
+        : (emptyCount > 0 ? "aucune offre en cache pour ces cabines ce mois-ci" : "aucune requête envoyée");
       Logger.log("Module premium : aucun résultat. Causes : " + diag);
       if (verbose) {
         replyTelegram_("😕 Aucun prix premium obtenu.\n\nCause : " + diag +
-          ".\n\nℹ️ « consentement » ou « anti-bot » = Google bloque les requêtes serveur d'Apps Script ; « aucune offre » = pas de vol dans cette cabine aux dates testées (" +
-          fmtDate_(dates.depart) + "→" + fmtDate_(dates.ret) + ").");
+          ".\n\nℹ️ « HTTP … » = souci d'accès Travelpayouts (token/quota) ; « aucune offre » = pas de prix affaires/première en cache pour " +
+          monthStart.substring(0, 7) + ". Les cabines avant sont peu mises en cache : il se peut qu'il n'y ait simplement rien.");
       }
       return;
     }
@@ -1245,7 +1255,7 @@ function runPremiumCheck_(verbose) {
     // Meilleur prix par (cabine, destination), alertes sur nouveaux records —
     // jamais au tout premier relevé (référence seulement).
     const lastPremium = { checkedAt: now.toISOString(), currency: cur, results: {} };
-    const summaryLines = ["🥂 Cabines premium (" + fmtDate_(dates.depart) + "→" + fmtDate_(dates.ret) + ", " + cur + ")"];
+    const summaryLines = ["🥂 Cabines premium (départs " + monthStart.substring(0, 7) + ", " + cur + ")"];
     cfg.destinations.forEach(function (dest) {
       let destShown = false;
       cabins.forEach(function (cabin) {
@@ -1270,7 +1280,9 @@ function runPremiumCheck_(verbose) {
     setJson_("PREMIUM_MINS", premiumMins);
     setJson_("LAST_PREMIUM", lastPremium);
 
-    if (verbose) replyTelegram_(summaryLines.join("\n") + "\n\n⚠️ Scraping non officiel de Google Flights — vérifie avant de réserver.");
+    if (verbose) replyTelegram_(summaryLines.join("\n") +
+      (dropped.length ? "\n\nℹ️ " + dropped.map(cabinLabel_).join("/") + " non couverte(s) par Travelpayouts." : "") +
+      "\n\nℹ️ Prix Travelpayouts en cache — vérifie le prix exact avant de réserver.");
   } catch (e) {
     // Filet de sécurité global : quoi qu'il arrive, ce module ne doit
     // jamais faire planter le trigger ni affecter le suivi éco.
@@ -1279,14 +1291,11 @@ function runPremiumCheck_(verbose) {
   }
 }
 
-/** Google Flights exige des dates précises (pas de fenêtre flexible) : on
- * échantillonne le début de la fenêtre de départ + un séjour moyen. */
-function premiumDates_(cfg) {
-  const depart = cfg.departWindow[0];
-  const days = Math.round((cfg.stayMin + cfg.stayMax) / 2);
-  const d = new Date(depart + "T12:00:00Z");
-  d.setUTCDate(d.getUTCDate() + days);
-  return { depart: depart, ret: d.toISOString().substring(0, 10) };
+/** Cabine → trip_class Travelpayouts. Renvoie null pour l'éco premium (non
+ * couverte) et l'éco (gérée par le tracker principal). */
+function tripClassFor_(cabin) {
+  const map = { "business": 1, "first": 2 };
+  return (cabin in map) ? map[cabin] : null;
 }
 
 function budgetsLabel_(cfg) {
@@ -1305,63 +1314,50 @@ function cabinLabel_(cabin) {
   return { "economy": "Éco", "premium-economy": "Éco premium", "business": "Affaires", "first": "Première" }[cabin] || cabin;
 }
 
-function fetchGoogleFlightsOffers_(origin, destination, cabin, currency, dates) {
-  const tfs = buildTfs_(
-    [
-      { date: dates.depart, from: origin, to: destination },
-      { date: dates.ret, from: destination, to: origin }
-    ],
-    cabin, "round-trip", 1
-  );
+/** Prix affaires/première via Travelpayouts v2/prices/latest (trip_class=1/2).
+ * Données EN CACHE pour le mois `monthStart` (YYYY-MM-01), aller-retour.
+ * Renvoie la même forme que l'ancien scraping, plus les dates trouvées :
+ *   { cabin, origin, destination, price, airlines, stops, departure_at, return_at }. */
+function fetchTravelpayoutsBusiness_(origin, destination, cabin, currency, monthStart) {
+  const tripClass = tripClassFor_(cabin);
+  if (tripClass === null) throw new Error(cabinLabel_(cabin) + " non couverte par Travelpayouts");
 
-  const url = "https://www.google.com/travel/flights?tfs=" + encodeURIComponent(tfs) +
-    "&hl=en&curr=" + currency.toUpperCase();
+  const params = {
+    origin: origin,
+    destination: destination,
+    currency: currency.toLowerCase(),
+    beginning_of_period: monthStart,
+    period_type: "month",
+    trip_class: tripClass,
+    one_way: "false",
+    sorting: "price",
+    limit: "30",
+    page: "1",
+    token: CONFIG_STATIC.TRAVELPAYOUTS_TOKEN
+  };
+  const url = "https://api.travelpayouts.com/v2/prices/latest?" + toQuery_(params);
 
-  const resp = UrlFetchApp.fetch(url, {
-    method: "get",
-    headers: {
-      "Cookie": "CONSENT=YES+cb.20210328-17-p0.en+FX+000; SOCS=CAI",
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9"
-    },
-    muteHttpExceptions: true
-  });
+  const resp = UrlFetchApp.fetch(url, { method: "get", muteHttpExceptions: true });
+  const code = resp.getResponseCode();
+  if (code !== 200) throw new Error("Travelpayouts HTTP " + code);
 
-  if (resp.getResponseCode() !== 200) {
-    throw new Error("HTTP " + resp.getResponseCode());
+  const body = JSON.parse(resp.getContentText());
+  if (!body || body.success === false) {
+    throw new Error("Travelpayouts : " + ((body && body.error) || "réponse invalide"));
   }
 
-  const html = resp.getContentText();
-  const scriptMatch = html.match(/<script class="ds:1"[^>]*>([\s\S]*?)<\/script>/);
-  if (!scriptMatch) {
-    // Aide au diagnostic : depuis les IP de datacenter d'Apps Script, Google
-    // sert souvent un mur de consentement ou une page anti-bot SANS le bloc
-    // ds:1. On qualifie la cause au lieu d'un vague « structure introuvable ».
-    if (/unusual traffic|not a robot|detected unusual|sorry\/index|recaptcha/i.test(html)) {
-      throw new Error("bloqué anti-bot Google");
-    }
-    if (/consent\.google|before you continue|avant de continuer|isConsentBanner/i.test(html)) {
-      throw new Error("mur de consentement Google");
-    }
-    throw new Error("structure ds:1 introuvable");
-  }
-
-  const js = scriptMatch[1];
-  const idx = js.indexOf("data:");
-  if (idx === -1) throw new Error("pas de champ data: dans le script");
-  const afterData = js.substring(idx + 5);
-  const lastComma = afterData.lastIndexOf(",");
-  const payload = JSON.parse(afterData.substring(0, lastComma));
-
-  const flightsRaw = payload[3] && payload[3][0];
-  if (!flightsRaw) return [];
-
-  const out = flightsRaw.map(function (k) {
-    const flight = k[0];
-    const price = k[1][0][1];
-    const airlines = flight[1];
-    const stops = flight[2].length - 1;
-    return { cabin: cabin, origin: origin, destination: destination, price: price, airlines: airlines, stops: stops };
+  const rows = (body && body.data) || [];
+  const out = rows.map(function (r) {
+    return {
+      cabin: cabin,
+      origin: origin,
+      destination: destination,
+      price: Math.round(r.value),
+      airlines: r.airline ? [r.airline] : [],
+      stops: (typeof r.number_of_changes === "number") ? r.number_of_changes : 0,
+      departure_at: r.depart_date || monthStart,
+      return_at: r.return_date || ""
+    };
   });
   out.sort(function (a, b) { return a.price - b.price; });
   return out;
@@ -1371,7 +1367,7 @@ function sendPremiumAlert_(best, previousMin, cur) {
   const msg = "🥂 Record battu — " + cabinLabel_(best.cabin) + " " + best.destination + " !\n\n" +
     "💰 " + best.price + " " + cur + " (record précédent : " + previousMin + ")\n" +
     "🛫 " + best.origin + " → " + best.destination + " · " + best.stops + " esc. · " + best.airlines.join(" + ") + "\n\n" +
-    "⚠️ Scraping non officiel de Google Flights — vérifie avant de réserver.";
+    "ℹ️ Prix Travelpayouts en cache — vérifie avant de réserver.";
   replyTelegram_(msg);
 }
 
@@ -1386,64 +1382,6 @@ function getOrCreatePremiumSheet_() {
     ]);
   }
   return sheet;
-}
-
-/** ---- Encodeur protobuf minimal (juste ce dont Google Flights a besoin) ---- */
-function pbVarint_(n) {
-  const out = [];
-  while (true) {
-    const b = n & 0x7f;
-    n = n >>> 7;
-    if (n) { out.push(b | 0x80); } else { out.push(b); break; }
-  }
-  return out;
-}
-
-function pbTag_(fieldNo, wireType) {
-  return pbVarint_((fieldNo << 3) | wireType);
-}
-
-function pbBytesField_(fieldNo, payloadBytes) {
-  return pbTag_(fieldNo, 2).concat(pbVarint_(payloadBytes.length)).concat(payloadBytes);
-}
-
-function pbVarintField_(fieldNo, value) {
-  return pbTag_(fieldNo, 0).concat(pbVarint_(value));
-}
-
-function asciiBytes_(s) {
-  const out = [];
-  for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 0xff);
-  return out;
-}
-
-function pbAirport_(code) {
-  return pbBytesField_(2, asciiBytes_(code));
-}
-
-function pbFlightLeg_(date, from, to) {
-  let b = [];
-  b = b.concat(pbBytesField_(2, asciiBytes_(date)));
-  b = b.concat(pbBytesField_(13, pbAirport_(from)));
-  b = b.concat(pbBytesField_(14, pbAirport_(to)));
-  return b;
-}
-
-const SEAT_CODE_ = { "economy": 1, "premium-economy": 2, "business": 3, "first": 4 };
-const TRIP_CODE_ = { "round-trip": 1, "one-way": 2, "multi-city": 3 };
-
-/** legs: [{date:'YYYY-MM-DD', from:'CDG', to:'ICN'}, ...] */
-function buildTfs_(legs, seat, trip, adults) {
-  let b = [];
-  legs.forEach(function (leg) {
-    b = b.concat(pbBytesField_(3, pbFlightLeg_(leg.date, leg.from, leg.to)));
-  });
-  let passengerBytes = [];
-  for (let i = 0; i < adults; i++) passengerBytes = passengerBytes.concat(pbVarint_(1)); // 1 = ADULT
-  b = b.concat(pbBytesField_(8, passengerBytes));
-  b = b.concat(pbVarintField_(9, SEAT_CODE_[seat]));
-  b = b.concat(pbVarintField_(19, TRIP_CODE_[trip]));
-  return Utilities.base64Encode(b);
 }
 
 /** ---- Google Sheet ---- */
