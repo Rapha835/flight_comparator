@@ -39,9 +39,10 @@ FlightList reste le seul outil combinant recherche par plage de dates et multi-a
 
 Guide complet pas-à-pas dans [`GUIDE_installation.md`](GUIDE_installation.md) — en résumé :
 
-1. Crée un compte gratuit [Travelpayouts](https://www.travelpayouts.com/) et récupère ton token API.
+1. Crée un compte gratuit [Travelpayouts](https://www.travelpayouts.com/) et récupère ton token API (suivi **éco**).
 2. Crée un bot Telegram via [@BotFather](https://t.me/BotFather) et récupère ton token + ton `chat_id`.
-3. Copie `flight_price_watch.gs` dans un nouveau projet [Google Apps Script](https://script.google.com), remplis le bloc `CONFIG_STATIC` avec tes identifiants, exécute `setup()`.
+3. *(Optionnel — pour les cabines avant)* Crée un compte [Duffel](https://duffel.com/), passe-le en **live** (connexion Stripe requise ; la recherche d'offres reste gratuite, 0 € tant que tu ne réserves pas) et récupère ton jeton **`duffel_live_…`**. Sans ça, seul l'éco est suivi.
+4. Copie `flight_price_watch.gs` dans un nouveau projet [Google Apps Script](https://script.google.com), remplis le bloc `CONFIG_STATIC` avec tes identifiants (`TRAVELPAYOUTS_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, et `DUFFEL_TOKEN` si tu veux les cabines avant), exécute `setup()`.
 
 C'est tout — le bot t'écrit sur Telegram et lance **l'onboarding : 8 questions rapides** (destinations, zone de départ, fenêtre de dates aller, fenêtre retour, durée du séjour, type de billet — éco/éco premium/affaires/first —, escales max, puis un budget PAR type de billet choisi, avec un repère de prix constaté pour l'éco). Réponds simplement ; « passer » garde la valeur proposée, `/annuler` garde tout par défaut. À la fin, première vérification et top 3 des prix. L'assistant se relance à tout moment avec `/config`.
 

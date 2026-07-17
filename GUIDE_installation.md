@@ -43,11 +43,14 @@ vérifie toujours le prix exact avant de payer.
 1. Va sur https://script.google.com → **Nouveau projet**.
 2. Supprime le code par défaut, colle tout le contenu de
    `flight_price_watch.gs` (fourni à côté de ce guide).
-3. Tout en haut du fichier, remplis le bloc `CONFIG_STATIC` — seules ces
-   3 lignes sont indispensables, tout le reste se règle ensuite dans Telegram :
+3. Tout en haut du fichier, remplis le bloc `CONFIG_STATIC` — ces 3 lignes
+   sont indispensables, tout le reste se règle ensuite dans Telegram :
    - `TRAVELPAYOUTS_TOKEN` → le token de l'étape 1
    - `TELEGRAM_BOT_TOKEN` → le token de l'étape 2
    - `TELEGRAM_CHAT_ID` → le chat_id de l'étape 2
+   - `DUFFEL_TOKEN` → *(optionnel)* ton jeton **`duffel_live_…`** si tu veux
+     suivre les cabines avant (voir le module en fin de guide). Sans lui,
+     seul l'éco est suivi.
 
    (Les valeurs `DEFAULT_*` en dessous — destinations, zone de départ,
    fenêtres de dates, devises… — ne sont que des points de départ proposés
@@ -63,8 +66,8 @@ Telegram et lance **l'assistant de configuration : 8 questions rapides**
 (destinations, zone de départ, fenêtre de dates aller, fenêtre retour,
 durée du séjour en nuits, type de billet — éco / éco premium / affaires /
 first —, escales max, puis un budget PAR type de billet choisi — chaque
-question budget affiche le prix constaté sur ta recherche : via l'API pour
-l'éco, via Google Flights pour les cabines avant). Réponds simplement ; « passer » garde la valeur proposée,
+question budget affiche le prix constaté sur ta recherche pour l'éco).
+Réponds simplement ; « passer » garde la valeur proposée,
 `/annuler` garde tout par défaut. À la fin, il lance une première
 vérification et t'envoie le top 3 des prix. Tu peux relancer l'assistant
 n'importe quand avec `/config`.
@@ -94,7 +97,7 @@ au lieu d'instantanément.
 - `/duree 14 21` — durée du séjour min/max (nuits)
 - `/cabines eco affaires` — type de billet suivi (éco, éco premium,
   affaires, first, toutes) ; l'éco est vérifiée toutes les 30 min, les
-  cabines avant 1x/jour + `/premium`
+  cabines avant en veille ~toutes les 4 h (+ alerte sous ta cible) + `/premium`
 - `/escales 1` — escales maxi par trajet (`/escales non` = peu importe)
 - `/budget 700` — budget repère éco ; `/budget affaires 2500` — par type de
   billet. Les prix au-dessus restent affichés, marqués ⚠️ (`/budget non` =
@@ -137,31 +140,41 @@ précisera) : `setup()` est ré-exécutable sans risque, il ne perd ni ta
 config ni ton historique. Vérifie avec `/aide` que la version affichée
 correspond à `SCRIPT_VERSION` en haut du code.
 
-## Module complémentaire — éco premium / affaires / première
+## Module complémentaire — éco premium / affaires / première (via Duffel)
 
-Travelpayouts ne sait pas filtrer par cabine. Ce module interroge donc
-directement Google Flights (la même requête que ton navigateur), une fois
-par jour seulement (vers 8h), pour un nombre limité de villes — volontairement
-peu fréquent pour rester discret.
+Travelpayouts ne gère que l'éco. Pour les **cabines avant**, ce module utilise
+l'**API Duffel** : de vraies offres **live** interrogées auprès des compagnies.
+Il te faut un jeton **`duffel_live_…`** dans `CONFIG_STATIC` (voir étape 3).
 
 **À savoir avant de t'y fier :**
-- C'est un scraping non officiel, pas une API sanctionnée comme Travelpayouts.
-  Ça peut casser sans prévenir si Google modifie sa page — c'est pour ça que
-  chaque appel est protégé individuellement : si ce module tombe en panne, le
-  suivi éco principal continue de tourner normalement, sans aucune coupure.
-- Google Flights exige des dates précises (pas de fenêtre flexible) : le
-  module échantillonne automatiquement le début de ta fenêtre de départ +
-  un séjour de durée moyenne (entre tes bornes min/max).
-- Les résultats vont dans un second onglet du même Google Sheet : **"Log
-  Premium"**, et apparaissent dans `/status`. `/premium` force une
-  vérification à la demande.
-- Alerte Telegram séparée dès qu'une cabine (éco premium, affaires ou
-  première) bat son record précédent, avec un rappel qu'il faut revérifier
-  le prix avant de réserver.
+- **Il faut le jeton LIVE.** Le mode test de Duffel ne renvoie que des vols
+  fictifs (« Duffel Airways »). Activer le live demande de connecter Stripe à
+  ton compte Duffel — la recherche d'offres reste gratuite (0 € tant que tu ne
+  réserves pas ; ce bot ne réserve jamais).
+- **Duffel cherche en direct (~10-15 s/route).** Le module est donc borné en
+  temps et en nombre de requêtes par passage (`PREMIUM_MAX_REQUESTS`,
+  `PREMIUM_TIME_BUDGET_MS`) pour ne jamais dépasser la limite d'exécution
+  d'Apps Script (6 min). Chaque appel est isolé : si Duffel échoue, le suivi
+  éco continue sans coupure.
+- **Deux usages.** `/premium` force une vérification à la demande (aperçu
+  rapide, toutes tes destinations). En fond, une **veille préventive**
+  (trigger `sweepPremium`) balaie toute la matrice par morceaux ~toutes les
+  4 h (`PREMIUM_SWEEP_INTERVAL_MS`) et couvre chaque destination via ses
+  principaux hubs (`PREMIUM_SWEEP_MAX_ORIGINS`).
+- **Alerte proactive.** Tu reçois un message dédié dès qu'un prix passe **sous
+  ta cible** (`/budget affaires 1800` → alerte si ≤ 1800), et aussi quand un
+  prix bat son record. Dédupliqué (pas de spam) et réarmé quand ça remonte.
+- Les résultats vont dans un second onglet du Google Sheet : **"Log Premium"**,
+  et apparaissent dans `/status`. Duffel fixe lui-même la devise de chaque offre.
+- ⚠️ **Quota Apps Script** (compte Gmail gratuit : ~90 min/jour de triggers).
+  Avec `pollTelegram` chaque minute + la veille Duffel, tu es généralement dans
+  les clous en suivant **une** cabine avant (affaires). Si tu ajoutes plusieurs
+  cabines ou vois le bot ralentir, augmente `PREMIUM_SWEEP_INTERVAL_MS` (6-8 h)
+  ou baisse `PREMIUM_SWEEP_MAX_ORIGINS`.
 - Les cabines suivies se choisissent dans l'onboarding ou via `/cabines`.
-  Réglages avancés (`PREMIUM_ENABLED`, `PREMIUM_MAX_ORIGINS`) dans
-  `CONFIG_STATIC` — relus à chaque passage, sauf pour activer/désactiver le
-  trigger quotidien lui-même (relance `setup`).
+  Réglages avancés (`PREMIUM_ENABLED`, `PREMIUM_MAX_ORIGINS`, `PREMIUM_SWEEP_*`)
+  dans `CONFIG_STATIC` — relus à chaque passage, sauf pour changer les triggers
+  eux-mêmes (relance `setup`).
 
 ## Pour arrêter ou ajuster
 
