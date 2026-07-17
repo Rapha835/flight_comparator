@@ -14,8 +14,8 @@
  *   budget max (avec repère : meilleur prix et moyenne constatés)
  *
  * L'éco est suivie toutes les 30 min via l'API Travelpayouts ; les cabines
- * avant (éco premium, affaires, première) 1x/jour + /premium à la demande, via
- * l'API Duffel (vraies offres live, toutes cabines).
+ * avant (éco premium, affaires, première) en veille ~toutes les 4 h + /premium
+ * à la demande, via l'API Duffel (vraies offres live, toutes cabines).
  *
  * Alertes Telegram uniquement quand :
  *   - un prix bat son record historique (par destination + devise), ou
@@ -46,14 +46,14 @@
  * COUNTRY_AIRPORTS ci-dessous.
  *
  * MODULE COMPLÉMENTAIRE — cabines premium (éco premium / affaires / première) :
- * API Duffel (offres live, toutes cabines), 1x/jour + à la demande via
+ * API Duffel (offres live, toutes cabines), veille ~4 h + à la demande via
  * /premium, entièrement isolé par try/catch. Si l'API échoue, le suivi éco
  * continue normalement. (Historique des sources abandonnées pour les cabines
  * avant : scraping Google Flights bloqué anti-bot ; Amadeus self-service
  * fermé le 17/07/2026 ; Travelpayouts = économie uniquement — voir v2.9.)
  */
 
-const SCRIPT_VERSION = "2.9.1";
+const SCRIPT_VERSION = "2.10";
 
 /************ CONFIGURATION STATIQUE — à personnaliser une fois ************/
 const CONFIG_STATIC = {
@@ -105,7 +105,16 @@ const CONFIG_STATIC = {
   // nombre de recherches ET le temps total pour rester sous la limite Apps
   // Script (6 min) : au-delà, /premium renvoie ce qu'il a déjà trouvé.
   PREMIUM_MAX_REQUESTS: 18,
-  PREMIUM_TIME_BUDGET_MS: 270000 // 4 min 30
+  // La veille en fond interroge moins de hubs que /premium (les grands hubs
+  // suffisent pour l'affaires) → moins d'appels Duffel, quota Apps Script tenu.
+  PREMIUM_SWEEP_MAX_ORIGINS: 3,
+  PREMIUM_TIME_BUDGET_MS: 270000, // 4 min 30 par morceau de balayage
+  // Veille préventive : intervalle entre deux balayages COMPLETS (défaut ~4 h,
+  // soit ~6/jour). Chaque balayage est découpé sur plusieurs passages du
+  // trigger sweepPremium (toutes les 30 min) pour ne jamais dépasser 6 min.
+  // ⚠️ Apps Script gratuit = ~90 min/jour de triggers cumulés : si le bot
+  // ralentit, augmente cette valeur ou baisse PREMIUM_MAX_ORIGINS.
+  PREMIUM_SWEEP_INTERVAL_MS: 14400000 // 4 h
 };
 
 // Code pays (ISO 3166-1 alpha-2) → aéroports principaux avec une vraie
@@ -176,7 +185,10 @@ function setup() {
   ScriptApp.newTrigger("checkPrices").timeBased().everyMinutes(30).create();
 
   if (CONFIG_STATIC.PREMIUM_ENABLED) {
-    ScriptApp.newTrigger("checkPremiumCabins").timeBased().everyDays(1).atHour(8).create();
+    // Veille préventive des cabines avant : le balayage complet est découpé sur
+    // plusieurs passages de ce trigger (voir sweepPremium / PREMIUM_SWEEP_*).
+    ScriptApp.newTrigger("sweepPremium").timeBased().everyMinutes(30).create();
+    props_().deleteProperty("PREMIUM_SWEEP"); // repart d'un balayage propre
   }
 
   replyTelegram_("🤖 Flight Price Watch v" + SCRIPT_VERSION + " installé !\n" +
@@ -308,7 +320,7 @@ function handleCommand_(text) {
     cfg.cabins = cabins;
     saveConfig_(cfg);
     replyTelegram_("✈️ Billets suivis : " + cabins.map(cabinLabel_).join(", ") + "." +
-      (cabins.indexOf("economy") === -1 ? "\n⚠️ Éco non suivie : les vérifications 30 min sont suspendues, cabines avant 1x/jour + /premium." : ""));
+      (cabins.indexOf("economy") === -1 ? "\n⚠️ Éco non suivie : les vérifications 30 min sont suspendues, cabines avant en veille ~4 h + /premium." : ""));
 
   } else if (cmd === "/escales") {
     const t = parseTransfers_(arg);
@@ -427,7 +439,7 @@ function wizardQuestion_(step, cfg, cabinIdx) {
       return "🌙 " + n + "Durée du séjour, en nuits ?\nEx : 14 21 (entre 14 et 21 nuits)\n(actuel : " + cfg.stayMin + "–" + cfg.stayMax + ")";
     case "cabines":
       return "✈️ " + n + "Type de billet ? Plusieurs possibles.\nEx : eco · eco premium · affaires · first · toutes\n(actuel : " + cfg.cabins.map(cabinLabel_).join(", ") + ")\n" +
-        "ℹ️ L'éco est vérifiée toutes les 30 min ; les cabines avant 1x/jour + /premium.";
+        "ℹ️ L'éco est vérifiée toutes les 30 min ; les cabines avant en veille ~4 h (alerte sous ta cible) + /premium.";
     case "escales":
       return "🔁 " + n + "Escales maxi par trajet ?\nEx : 0 (direct), 1, 2, ou « non » (peu importe)\n(actuel : " + (cfg.maxTransfers === null ? "peu importe" : cfg.maxTransfers) + ")";
     case "budget": {
@@ -1154,14 +1166,150 @@ function toQuery_(params) {
  * Prix par cabine AVANT (éco premium / affaires / première) via l'API Duffel :
  * de vraies offres LIVE interrogées auprès des compagnies. Duffel cherche en
  * direct (~10-15 s/route) → on plafonne le nombre de recherches et le temps
- * total (voir CONFIG_STATIC). Volontairement peu fréquent (1x/jour + /premium
- * à la demande), et TOUT est protégé par des try/catch — si l'API échoue, le
- * suivi éco principal continue sans interruption.
+ * total (voir CONFIG_STATIC). Deux usages : /premium à la demande (aperçu
+ * rapide partiel, runPremiumCheck_), et une VEILLE PRÉVENTIVE en fond
+ * (sweepPremium) qui balaie toute la matrice par morceaux ~toutes les 4 h et
+ * ALERTE dès qu'un prix passe sous ta cible (/budget) ou bat un record. TOUT
+ * est protégé par des try/catch — si l'API échoue, le suivi éco continue.
  */
 
-/** Trigger quotidien (l'événement du trigger est ignoré). */
+/** Lancement manuel d'un aperçu premium en fond (non déclenché ; utile pour
+ * tester depuis l'éditeur). La veille automatique passe par sweepPremium. */
 function checkPremiumCabins() {
   runPremiumCheck_(false);
+}
+
+/* ---------- VEILLE PRÉVENTIVE DÉCOUPÉE (trigger toutes les 30 min) ---------- */
+
+/** Point d'entrée du trigger : fait avancer le balayage, isolé de toute erreur. */
+function sweepPremium() {
+  try { sweepPremiumTick_(); }
+  catch (e) { Logger.log("sweepPremium — erreur ignorée : " + e); }
+}
+
+/** Un « tick » : reprend le balayage complet là où il en était (curseur dans
+ * les propriétés), traite un morceau borné en temps/nombre, et alerte au fil
+ * de l'eau. Un balayage complet s'étale donc sur plusieurs ticks ; un nouveau
+ * balayage ne démarre qu'après PREMIUM_SWEEP_INTERVAL_MS. */
+function sweepPremiumTick_() {
+  if (!CONFIG_STATIC.PREMIUM_ENABLED) return;
+  const cfg = getConfig_();
+  if (cfg.paused) return;
+
+  const cabins = cfg.cabins.filter(function (c) {
+    return c !== "economy" && duffelCabin_(c) !== null;
+  });
+  if (cabins.length === 0) return;
+
+  const origins = premiumOrigins_(cfg, CONFIG_STATIC.PREMIUM_SWEEP_MAX_ORIGINS);
+  const dates = premiumDates_(cfg);
+  // Matrice de routes, ORIGINE-d'abord (couvre toutes les destinations tôt).
+  const routes = [];
+  origins.forEach(function (o) {
+    cfg.destinations.forEach(function (d) {
+      cabins.forEach(function (c) { routes.push(o + ">" + d + ">" + c); });
+    });
+  });
+  if (routes.length === 0) return;
+  // Signature : si la config change, on redémarre un balayage propre.
+  const sig = origins.join(",") + "|" + cfg.destinations.join(",") + "|" +
+    cabins.join(",") + "|" + dates.depart + ">" + dates.ret;
+
+  let sweep = getJson_("PREMIUM_SWEEP", null);
+  const now = Date.now();
+  if (!sweep || sweep.sig !== sig) {
+    sweep = { sig: sig, cursor: 0, lastDoneMs: 0 }; // neuf / config changée
+  } else if (sweep.cursor >= routes.length) {
+    // Balayage précédent terminé : attendre l'intervalle avant d'en relancer un.
+    if ((now - (sweep.lastDoneMs || 0)) < CONFIG_STATIC.PREMIUM_SWEEP_INTERVAL_MS) return;
+    sweep.cursor = 0;
+  }
+  // sinon : balayage en cours (cursor < length) → on continue au curseur.
+
+  const sheet = getOrCreatePremiumSheet_();
+  const premiumMins = getJson_("PREMIUM_MINS", {});
+  const belowState = getJson_("PREMIUM_BELOW", {});
+  const lastPremium = getJson_("LAST_PREMIUM", null) || { results: {} };
+  if (!lastPremium.results) lastPremium.results = {};
+
+  const startMs = Date.now();
+  let processed = 0;
+  while (sweep.cursor < routes.length &&
+         processed < CONFIG_STATIC.PREMIUM_MAX_REQUESTS &&
+         (Date.now() - startMs) < CONFIG_STATIC.PREMIUM_TIME_BUDGET_MS) {
+    const parts = routes[sweep.cursor].split(">");
+    const origin = parts[0], dest = parts[1], cabin = parts[2];
+    sweep.cursor++;
+    processed++;
+    try {
+      const offers = fetchDuffelBusiness_(origin, dest, cabin, dates);
+      if (offers.length > 0) {
+        const best = offers[0];
+        sheet.appendRow([
+          new Date(), origin, dest, cabin, best.price, best.currency,
+          best.airlines.join(" + "), best.stops, best.departure_at, best.return_at
+        ]);
+        processPremiumBest_(best, cfg, premiumMins, belowState, lastPremium);
+      }
+    } catch (e) {
+      Logger.log("sweepPremium — échec " + origin + "→" + dest + "/" + cabin + " : " + e);
+    }
+    Utilities.sleep(200);
+  }
+
+  lastPremium.checkedAt = new Date().toISOString();
+  setJson_("LAST_PREMIUM", lastPremium);
+  setJson_("PREMIUM_MINS", premiumMins);
+  setJson_("PREMIUM_BELOW", belowState);
+  if (sweep.cursor >= routes.length) {
+    sweep.lastDoneMs = Date.now();
+    Logger.log("Balayage premium terminé (" + routes.length + " routes).");
+  }
+  setJson_("PREMIUM_SWEEP", sweep);
+}
+
+/** Met à jour les stores (dernier prix, records) pour une offre, et déclenche
+ * les alertes : priorité à « sous la cible » (budget), sinon « record battu ».
+ * L'alerte sous cible est dédupliquée (on ne re-alerte que si ça baisse
+ * encore) et se réarme quand le prix repasse au-dessus de la cible. */
+function processPremiumBest_(best, cfg, premiumMins, belowState, lastPremium) {
+  const cur = cfg.currencies[0];
+  const dest = best.destination, cabin = best.cabin;
+  const destKey = cabin + "|" + dest;
+  const key = destKey + "|" + best.currency;
+
+  // Dernier meilleur prix connu (pour /status).
+  const prevBest = lastPremium.results[destKey];
+  if (!prevBest || best.price < prevBest.price) lastPremium.results[destKey] = best;
+
+  // Alerte SOUS LA CIBLE (comparaison seulement si même devise que ta cible).
+  let alerted = false;
+  const target = budgetFor_(cfg, cabin);
+  if (target !== null && best.currency === cur) {
+    if (best.price <= target) {
+      if (belowState[key] === undefined || best.price < belowState[key]) {
+        sendTargetAlert_(best, target);
+        belowState[key] = best.price;
+        alerted = true;
+      }
+    } else if (belowState[key] !== undefined) {
+      delete belowState[key]; // repassé au-dessus → réarmé pour la prochaine baisse
+    }
+  }
+
+  // Record historique + alerte record (sauf si on vient déjà d'alerter la cible).
+  const prevMin = (key in premiumMins) ? premiumMins[key] : null;
+  if (prevMin === null || best.price < prevMin) {
+    premiumMins[key] = best.price;
+    if (prevMin !== null && !alerted) sendPremiumAlert_(best, prevMin, best.currency);
+  }
+}
+
+function sendTargetAlert_(best, target) {
+  replyTelegram_("🎯 Sous ta cible — " + cabinLabel_(best.cabin) + " " + best.destination + " !\n\n" +
+    "💰 " + best.price + " " + best.currency + " (cible ≤ " + target + ")\n" +
+    "🛫 " + best.origin + " → " + best.destination + " · " + best.stops + " esc. · " + best.airlines.join(" + ") + "\n\n" +
+    "ℹ️ Offre live Duffel — vérifie avant de réserver.");
 }
 
 function runPremiumCheck_(verbose) {
@@ -1313,14 +1461,15 @@ function duffelCabin_(cabin) {
 /** Origines pour /premium : UN hub par pays/ville de départ (le 1er aéroport),
  * pour un vrai spread géographique plutôt que 5 aéroports du même pays. Duffel
  * étant lent, on plafonne à PREMIUM_MAX_ORIGINS pour tenir le budget-temps. */
-function premiumOrigins_(cfg) {
+function premiumOrigins_(cfg, max) {
+  const cap = max || CONFIG_STATIC.PREMIUM_MAX_ORIGINS;
   const out = [];
   cfg.origins.forEach(function (entry) {
     const code = entry.toUpperCase();
     const hub = (code.length === 2 && COUNTRY_AIRPORTS[code]) ? COUNTRY_AIRPORTS[code][0] : code;
     if (out.indexOf(hub) === -1) out.push(hub);
   });
-  return out.slice(0, CONFIG_STATIC.PREMIUM_MAX_ORIGINS);
+  return out.slice(0, cap);
 }
 
 /** Duffel exige des dates précises : on échantillonne le début de la fenêtre

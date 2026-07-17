@@ -17,13 +17,17 @@ Ce projet reconstruit l'essentiel — comparaison de dizaines d'aéroports europ
 Un script [Google Apps Script](https://script.google.com) tourne en permanence sur les serveurs Google (gratuit, pas besoin de garder un ordinateur ou un navigateur ouvert) :
 
 1. Toutes les 30 minutes, il interroge l'[API Travelpayouts/Aviasales](https://support.travelpayouts.com/hc/en-us/articles/203956163-Aviasales-Data-API) (gratuite, sanctionnée pour cet usage) pour chaque combinaison ville de départ × destination × devise — par lots de requêtes parallèles, donc rapide même avec des dizaines d'aéroports.
-2. Il filtre selon TES critères, façon FlightList : fenêtre de dates aller (ex. 1–14 oct), fenêtre retour (ex. 19 oct–3 nov), durée du séjour en nuits, escales max, budget max. Les cabines avant (éco premium, affaires, first) choisies à l'onboarding sont vérifiées 1x/jour + `/premium` à la demande.
+2. Il filtre selon TES critères, façon FlightList : fenêtre de dates aller (ex. 1–14 oct), fenêtre retour (ex. 19 oct–3 nov), durée du séjour en nuits, escales max, budget max. Les cabines avant (éco premium, affaires, first) choisies à l'onboarding sont surveillées en fond ~toutes les 4 h (avec **alerte dès qu'un prix passe sous ta cible**) + `/premium` à la demande.
 3. Il compare le meilleur prix trouvé à l'historique déjà enregistré, par destination et par devise, et envoie une alerte Telegram uniquement quand ça vaut le coup : **nouveau record**, ou **prix anormalement bas vs la moyenne relevée** (seuil dynamique, ex. 40 % sous la médiane → probable erreur de prix) — jamais deux fois pour le même prix.
 4. Tout l'historique est journalisé dans un Google Sheet créé automatiquement.
 
 Toute la configuration se fait dans Telegram : un **assistant de 8 questions** (`/config`) se lance à l'installation, et chaque critère reste modifiable à l'unité par commande — aucun besoin de rouvrir le code au quotidien.
 
-Un module complémentaire, optionnel et isolé, surveille les **cabines avant (éco premium, affaires, première)** via l'**API Duffel** — de vraies offres **live** interrogées auprès des compagnies. Il est protégé par un filet de sécurité complet : s'il échoue, le suivi économique principal continue de tourner sans aucune interruption. Duffel cherchant en direct (~10-15 s/route), le nombre de recherches et le temps total sont plafonnés (voir `CONFIG_STATIC`) pour rester sous la limite d'exécution d'Apps Script. *(Historique des sources abandonnées pour les cabines avant : scraping Google Flights — bloqué anti-bot depuis les serveurs Apps Script ; Amadeus self-service — portail gratuit fermé le 17/07/2026 ; Travelpayouts — économie uniquement.)*
+Un module complémentaire, optionnel et isolé, surveille les **cabines avant (éco premium, affaires, première)** via l'**API Duffel** — de vraies offres **live** interrogées auprès des compagnies. En plus de `/premium` à la demande, une **veille préventive** balaie toute la matrice origines×destinations en fond (~toutes les 4 h, découpée sur plusieurs passages pour ne jamais dépasser la limite d'exécution d'Apps Script) et **t'alerte dès qu'un prix passe sous ta cible** (`/budget`) ou bat son record. Il est protégé par un filet de sécurité complet : s'il échoue, le suivi économique principal continue sans interruption.
+
+> ⚠️ **Quota Apps Script.** Un compte Google gratuit plafonne le temps de triggers à ~90 min/jour. Comme `pollTelegram` tourne déjà chaque minute, la veille Duffel utilise moins de hubs (`PREMIUM_SWEEP_MAX_ORIGINS`) et un intervalle réglable (`PREMIUM_SWEEP_INTERVAL_MS`). Si le bot ralentit / cesse de répondre, augmente l'intervalle ou baisse le nombre de hubs.
+
+*(Historique des sources abandonnées pour les cabines avant : scraping Google Flights — bloqué anti-bot depuis les serveurs Apps Script ; Amadeus self-service — portail gratuit fermé le 17/07/2026 ; Travelpayouts — économie uniquement.)*
 
 ## Ce que ça compare
 
@@ -107,7 +111,7 @@ Vérifie que tu as bien **sauvegardé** le fichier (Cmd/Ctrl+S) — les triggers
 
 ### Le panneau Exécutions montre des erreurs `Script function not found: xxx`
 
-Un déclencheur (trigger) d'une ancienne version du script appelle une fonction qui n'existe plus. Exécute `setup()` : il supprime **tous** les anciens triggers avant de recréer les bons. Tu peux vérifier dans le panneau ⏰ **Déclencheurs** qu'il ne reste que `pollTelegram` (1 min), `checkPrices` (30 min) et éventuellement `checkPremiumCabins` (1x/jour).
+Un déclencheur (trigger) d'une ancienne version du script appelle une fonction qui n'existe plus. Exécute `setup()` : il supprime **tous** les anciens triggers avant de recréer les bons. Tu peux vérifier dans le panneau ⏰ **Déclencheurs** qu'il ne reste que `pollTelegram` (1 min), `checkPrices` (30 min) et éventuellement `sweepPremium` (30 min — veille des cabines avant).
 
 ### Je reçois la même alerte en boucle
 
